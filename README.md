@@ -70,7 +70,8 @@ console prefix in the `WSFW_PREFIX` environment variable (default `10`).
 ## Known issues
 
 - `game_console` returns only the command's echo, not what it printed. The command does run. Check its effect through
-  logs or `game_script_vars` until this is fixed.
+  `game_script_vars`, or have the script write to a user log (`Debug.OpenUserLog`, `Debug.TraceUser`) and read it with
+  `read_log`.
 
 ## Licence
 

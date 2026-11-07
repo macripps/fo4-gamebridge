@@ -86,8 +86,9 @@ def game_status() -> str:
 
 @mcp.tool()
 def game_console(command: str) -> str:
-    """Run one console command on the game's main thread and return what it printed. Commands act on the running game.
-    Use "prid <ref>" first for commands that need a selected reference; the selection carries over between calls."""
+    """Run one console command on the game's main thread. Commands act on the running game. Only the command's echo
+    comes back, not its output: check the effect with read_log (e.g. a script's Debug.TraceUser log) or
+    game_script_vars. Use "prid <ref>" first for commands that need a selected reference."""
     return _call("console", command)
 
 
