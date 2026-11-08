@@ -8,7 +8,7 @@
 //   request   id<TAB>op[<TAB>arg...]
 //   reply     {"id":"...","ok":true,"result":"..."}
 //   ops       ping | console <command> | vars <formid hex> <script> | player | ref <formid hex>
-//             | near <radius> [<base form type> [<x> <y> <z>]]
+//             | near <radius> [<base form type> [<x> <y> <z>]] | perf [<seconds>]
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -290,6 +290,68 @@ namespace Bridge
         return { true, out };
     }
 
+    // Frame times over a_seconds of wall time. Runs on the network thread: it queues one main-thread task at a time,
+    // each reading the engine's own timer (BSTimer: realTimeDelta is the last frame's length, lastTime its timestamp),
+    // and keeps one sample per distinct frame.
+    Reply Perf(float a_seconds)
+    {
+        struct Sample
+        {
+            std::uint64_t frame{ 0 };
+            float         delta{ 0.0f };
+        };
+
+        std::vector<float> deltas;
+        std::uint64_t      lastFrame = 0;
+        const auto         start = std::chrono::steady_clock::now();
+        const auto         until = start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                       std::chrono::duration<float>(a_seconds));
+
+        while (std::chrono::steady_clock::now() < until) {
+            auto       sample = std::make_shared<Sample>();
+            const auto reply = OnMainThread([sample]() {
+                const auto timer = RE::BSTimer::GetSingleton();
+                if (!timer) {
+                    return Reply{ false, "no BSTimer" };
+                }
+                sample->frame = timer->lastTime;
+                sample->delta = timer->realTimeDelta;
+                return Reply{ true, {} };
+            });
+            if (!reply.ok) {
+                return reply;
+            }
+            if (sample->frame != lastFrame) {
+                lastFrame = sample->frame;
+                deltas.push_back(sample->delta * 1000.0f);
+            }
+        }
+
+        const auto elapsed = std::chrono::duration<float>(std::chrono::steady_clock::now() - start).count();
+        if (deltas.size() < 2) {
+            return { false, std::format("only {} distinct frames in {:.1f} s: the timer isn't advancing", deltas.size(), elapsed) };
+        }
+        deltas.erase(deltas.begin());  // the first sample's frame began before we started
+
+        float total = 0.0f;
+        for (const auto d : deltas) {
+            total += d;
+        }
+        std::vector<float> sorted = deltas;
+        std::ranges::sort(sorted);
+        const auto at = [&](float a_fraction) {
+            return sorted[(std::min)(sorted.size() - 1, static_cast<std::size_t>(a_fraction * sorted.size()))];
+        };
+        const auto mean = total / deltas.size();
+
+        // A sample's round trip can span two frames, so not every frame is sampled; the timer covers each one it reads.
+        return { true, std::format("fps {:.1f} over {:.2f} s (engine frame timer)\n"
+                                   "frame ms: mean {:.2f}, median {:.2f}, 99th percentile {:.2f}, worst {:.2f}\n"
+                                   "sampled {} of about {:.0f} frames",
+                           1000.0f / mean, elapsed, mean, at(0.5f), at(0.99f), sorted.back(), deltas.size(),
+                           elapsed * 1000.0f / mean) };
+    }
+
     Reply Handle(const std::vector<std::string>& a_parts)
     {
         const auto& op = a_parts[1];
@@ -344,6 +406,15 @@ namespace Bridge
                     origin = RE::NiPoint3{ std::stof(a_parts[4]), std::stof(a_parts[5]), std::stof(a_parts[6]) };
                 }
                 return OnMainThread([radius, type, origin]() { return Near(radius, type, origin); });
+            } catch (const std::exception& e) {
+                return Reply{ false, e.what() };
+            }
+        }
+
+        if (op == "perf") {
+            try {
+                const auto seconds = a_parts.size() >= 3 ? std::stof(a_parts[2]) : 3.0f;
+                return Perf(std::clamp(seconds, 0.5f, 10.0f));
             } catch (const std::exception& e) {
                 return Reply{ false, e.what() };
             }

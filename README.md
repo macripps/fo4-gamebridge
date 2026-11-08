@@ -12,17 +12,20 @@ It was built to debug Workshop Framework and Sim Settlements 2 scripts while the
 | Part | What it does |
 |---|---|
 | `GameBridge.dll` (`src/`) | F4SE plugin. Listens on `127.0.0.1:47830` on its own thread, so `ping` answers even when Papyrus is jammed. Anything that touches game state runs on the main thread through F4SE's task queue. |
-| `server.py` | MCP server that talks to the plugin. Its tools: `game_status`, `game_console`, `game_script_vars`, `game_player`, `game_ref`, `game_refs_near`, `wsfw_runners`, `papyrus_stacks`, `read_log`, `latest_screenshots`. |
+| `server.py` | MCP server that talks to the plugin. Its tools: `game_status`, `game_console`, `game_script_vars`, `game_player`, `game_ref`, `game_refs_near`, `game_perf`, `wsfw_runners`, `papyrus_stacks`, `read_log`, `latest_screenshots`. |
 
 The protocol is one line each way: `id<TAB>op[<TAB>arg...]` in, `{"id":"...","ok":true,"result":"..."}` out. The
 operations are `ping`, `console <command>`, `vars <formid hex> <script>`, `player`, `ref <formid hex>` and
-`near <radius> [<base form type> [<x> <y> <z>]]`.
+`near <radius> [<base form type> [<x> <y> <z>]]` and `perf [<seconds>]`.
 
 - `game_player`: the player's cell, position and rotation (degrees).
 - `game_ref`: one reference's base object and type, cell, position, rotation, disabled/deleted/3D state, and every
   linked ref (keyword → target), including links a script added at runtime.
 - `game_refs_near`: references within a radius of the player or a point, nearest first (up to 300), optionally only
   those whose base is a given form type (`LIGH`, `STAT`, `CONT`...). Finds objects scripts spawned (`FF...` FormIDs).
+- `game_perf`: frame rate and frame times (mean, median, 99th percentile, worst) over 0.5 to 10 seconds, read from the
+  engine's own frame timer. Compare runs from the same spot and facing, e.g. a room before and after a change. With
+  vsync on, a cost shows first in the 99th percentile and worst frames.
 
 Forms print as `FormID EditorID [Plugin.esm] "Display name"`: the editor ID only where the game keeps it at runtime
 (keywords, quests), the defining plugin (none for forms created in game), and the display name if there is one.

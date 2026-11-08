@@ -132,6 +132,14 @@ def game_refs_near(radius: float, form_type: str = "", x: float | None = None, y
 
 
 @mcp.tool()
+def game_perf(seconds: float = 3.0) -> str:
+    """Frame rate and frame times (mean, median, 99th percentile, worst, in ms) over a few seconds (0.5 to 10) of
+    play, from the engine's own frame timer. Stand still and keep the view steady while it samples, and compare runs
+    from the same spot and facing (e.g. a room before and after its design is built)."""
+    return _call("perf", str(seconds))
+
+
+@mcp.tool()
 def latest_screenshots(count: int = 1) -> list:
     """The newest game screenshots (from FO4_SCREENSHOTS), newest first, shrunk to 1600 px wide when Pillow is
     installed. Works with the game closed."""
