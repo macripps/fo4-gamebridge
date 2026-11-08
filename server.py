@@ -3,7 +3,8 @@
 Log and screenshot tools work with the game closed. Game tools need the game running with GameBridge.dll in
 Data/F4SE/Plugins. Needs the mcp package (2.x): pip install mcp. Pillow (optional) shrinks screenshots.
 Environment: WSFW_PREFIX (see below), FO4_SCREENSHOTS (folder the game's screenshots land in, e.g. Steam's
-userdata/<id>/760/remote/377160/screenshots).
+userdata/<id>/760/remote/377160/screenshots), FO4_GAME_SCREENSHOTS (the folder in the game's own sScreenShotBaseName,
+for game_screenshot).
 """
 import glob
 import io
@@ -13,6 +14,7 @@ import re
 import socket
 import threading
 import itertools
+import time
 
 from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -132,6 +134,35 @@ def game_refs_near(radius: float, form_type: str = "", x: float | None = None, y
 
 
 @mcp.tool()
+def game_place(form_id: str, distance: float = 200.0) -> str:
+    """Place a new reference of a base object (load-order FormID in hex, e.g. "16000801") distance units in front of
+    the player, upright and turned the way the player faces. Returns the new reference (an FF... FormID) and where it
+    is; move or delete it with game_console ("prid <id>", "setpos z ...", "markfordelete")."""
+    return _call("place", form_id, str(distance))
+
+
+@mcp.tool()
+def game_screenshot() -> list:
+    """Take a game screenshot (as the screenshot key does) and return it. Needs FO4_GAME_SCREENSHOTS set to the
+    folder in the game's sScreenShotBaseName (Fallout4Prefs.ini, [Display]), and bAllowScreenshot=1."""
+    folder = os.environ.get("FO4_GAME_SCREENSHOTS", "")
+    if not folder or not os.path.isdir(folder):
+        raise ToolError("set FO4_GAME_SCREENSHOTS to the folder in the game's sScreenShotBaseName")
+    pattern = [os.path.join(folder, "*.png"), os.path.join(folder, "*.jpg"), os.path.join(folder, "*.bmp")]
+    before = {p: os.path.getmtime(p) for g in pattern for p in glob.glob(g)}
+    _call("screenshot")
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        time.sleep(0.5)
+        new = [p for g in pattern for p in glob.glob(g) if before.get(p) != os.path.getmtime(p)]
+        if new:
+            path = max(new, key=os.path.getmtime)
+            time.sleep(0.5)  # let the game finish writing it
+            return [os.path.basename(path), _image(path)]
+    raise ToolError(f"no new screenshot in {folder} after 10 s (is the game window in front?)")
+
+
+@mcp.tool()
 def game_perf(seconds: float = 3.0) -> str:
     """Frame rate and frame times (mean, median, 99th percentile, worst, in ms) over a few seconds (0.5 to 10) of
     play, from the engine's own frame timer. Stand still and keep the view steady while it samples, and compare runs
@@ -151,18 +182,22 @@ def latest_screenshots(count: int = 1) -> list:
         raise ToolError(f"no screenshots in {SCREENSHOTS}")
     out = []
     for path in files:
-        out.append(os.path.basename(path))
-        try:
-            from PIL import Image as PILImage
-            with PILImage.open(path) as im:
-                if im.width > SCREENSHOT_WIDTH:
-                    im = im.resize((SCREENSHOT_WIDTH, round(im.height * SCREENSHOT_WIDTH / im.width)))
-                buffer = io.BytesIO()
-                im.convert("RGB").save(buffer, "JPEG", quality=85)
-            out.append(Image(data=buffer.getvalue(), format="jpeg"))
-        except ImportError:
-            out.append(Image(path=path))
+        out += [os.path.basename(path), _image(path)]
     return out
+
+
+def _image(path):
+    """An image for the client, shrunk to SCREENSHOT_WIDTH as JPEG when Pillow is installed."""
+    try:
+        from PIL import Image as PILImage
+    except ImportError:
+        return Image(path=path)
+    with PILImage.open(path) as im:
+        if im.width > SCREENSHOT_WIDTH:
+            im = im.resize((SCREENSHOT_WIDTH, round(im.height * SCREENSHOT_WIDTH / im.width)))
+        buffer = io.BytesIO()
+        im.convert("RGB").save(buffer, "JPEG", quality=85)
+    return Image(data=buffer.getvalue(), format="jpeg")
 
 
 @mcp.tool()

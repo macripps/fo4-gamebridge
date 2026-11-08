@@ -8,7 +8,8 @@
 //   request   id<TAB>op[<TAB>arg...]
 //   reply     {"id":"...","ok":true,"result":"..."}
 //   ops       ping | console <command> | vars <formid hex> <script> | player | ref <formid hex>
-//             | near <radius> [<base form type> [<x> <y> <z>]] | perf [<seconds>]
+//             | near <radius> [<base form type> [<x> <y> <z>]] | perf [<seconds>] | place <formid hex> [<distance>]
+//             | screenshot
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -260,7 +261,8 @@ namespace Bridge
         return { true, out };
     }
 
-    // References within a_radius of a point (default: the player) in the player's cell, nearest first. a_type filters by
+    // References within a_radius of a point (default: the player), in the player's interior cell or the loaded exterior
+    // cells, nearest first. a_type filters by
     // the base's form type ("LIGH", "STAT", "CONT", ...); empty means all.
     Reply Near(float a_radius, const std::string& a_type, std::optional<RE::NiPoint3> a_origin)
     {
@@ -271,8 +273,14 @@ namespace Bridge
         }
         const auto origin = a_origin.value_or(player->GetPosition());
 
+        const auto tes = RE::TES::GetSingleton();
+        if (!tes || a_radius <= 0.0f) {
+            return { false, "no TES, or radius not above 0" };
+        }
+
+        // TES walks the interior cell, or every attached exterior cell in the loaded grid (plus the sky cell).
         std::vector<std::pair<float, std::string>> rows;
-        cell->ForEachReferenceInRange(origin, a_radius, [&](RE::TESObjectREFR* a_ref) {
+        tes->ForEachReferenceInRange(origin, a_radius, [&](RE::TESObjectREFR* a_ref) {
             const auto base = a_ref ? a_ref->GetObjectReference() : nullptr;
             if (base && a_ref != player && (a_type.empty() || a_type == base->GetFormTypeString())) {
                 const auto distance = origin.GetDistance(a_ref->GetPosition());
@@ -288,6 +296,52 @@ namespace Bridge
             out += rows[i].second + "\n";
         }
         return { true, out };
+    }
+
+    // Places a new reference of a base object a_distance in front of the player, upright, turned the way the player
+    // faces (so a static's front, its -Y side, faces the player). Replaces placeatme plus setpos/setangle by hand.
+    Reply Place(const std::string& a_formID, float a_distance)
+    {
+        const auto player = RE::PlayerCharacter::GetSingleton();
+        const auto cell = player ? player->GetParentCell() : nullptr;
+        const auto handler = RE::TESDataHandler::GetSingleton();
+        if (!cell || !handler) {
+            return { false, "no player cell" };
+        }
+        const auto form = RE::TESForm::GetFormByID(static_cast<RE::TESFormID>(std::stoul(a_formID, nullptr, 16)));
+        const auto base = form ? form->As<RE::TESBoundObject>() : nullptr;
+        if (!base) {
+            return { false, "no placeable base object " + a_formID };
+        }
+
+        const auto heading = player->data.angle.z;
+        const auto at = player->GetPosition();
+        RE::NEW_REFR_DATA data;
+        data.location = RE::NiPoint3{ at.x + std::sin(heading) * a_distance, at.y + std::cos(heading) * a_distance, at.z };
+        data.direction = RE::NiPoint3{ 0.0f, 0.0f, heading };
+        data.object = base;
+        if (cell->IsInterior()) {
+            data.interior = cell;
+        } else {
+            data.world = cell->worldSpace;
+        }
+
+        const auto ref = handler->CreateReferenceAtLocation(data).get();
+        if (!ref) {
+            return { false, "the game didn't create the reference" };
+        }
+        return { true, std::format("placed {}\n{}", Name(ref.get()), Where(ref.get())) };
+    }
+
+    // Queues a screenshot, as the screenshot key does. It's saved to the game's sScreenShotBaseName (Fallout4Prefs.ini).
+    Reply Screenshot()
+    {
+        const auto controls = RE::MenuControls::GetSingleton();
+        if (!controls) {
+            return { false, "no MenuControls" };
+        }
+        return controls->QueueScreenshot() ? Reply{ true, "screenshot queued" } :
+                                             Reply{ false, "a screenshot is already queued, or screenshots are off" };
     }
 
     // Frame times over a_seconds of wall time. Runs on the network thread: it queues one main-thread task at a time,
@@ -409,6 +463,26 @@ namespace Bridge
             } catch (const std::exception& e) {
                 return Reply{ false, e.what() };
             }
+        }
+
+        if (op == "place" && a_parts.size() >= 3) {
+            try {
+                const auto formID = a_parts[2];
+                const auto distance = a_parts.size() >= 4 ? std::stof(a_parts[3]) : 200.0f;
+                return OnMainThread([formID, distance]() {
+                    try {
+                        return Place(formID, distance);
+                    } catch (const std::exception& e) {
+                        return Reply{ false, e.what() };
+                    }
+                });
+            } catch (const std::exception& e) {
+                return Reply{ false, e.what() };
+            }
+        }
+
+        if (op == "screenshot") {
+            return OnMainThread([]() { return Screenshot(); });
         }
 
         if (op == "perf") {

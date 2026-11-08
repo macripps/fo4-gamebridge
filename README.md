@@ -12,16 +12,23 @@ It was built to debug Workshop Framework and Sim Settlements 2 scripts while the
 | Part | What it does |
 |---|---|
 | `GameBridge.dll` (`src/`) | F4SE plugin. Listens on `127.0.0.1:47830` on its own thread, so `ping` answers even when Papyrus is jammed. Anything that touches game state runs on the main thread through F4SE's task queue. |
-| `server.py` | MCP server that talks to the plugin. Its tools: `game_status`, `game_console`, `game_script_vars`, `game_player`, `game_ref`, `game_refs_near`, `game_perf`, `wsfw_runners`, `papyrus_stacks`, `read_log`, `latest_screenshots`. |
+| `server.py` | MCP server that talks to the plugin. Its tools: `game_status`, `game_console`, `game_script_vars`, `game_player`, `game_ref`, `game_refs_near`, `game_place`, `game_screenshot`, `game_perf`, `wsfw_runners`, `papyrus_stacks`, `read_log`, `latest_screenshots`. |
 
 The protocol is one line each way: `id<TAB>op[<TAB>arg...]` in, `{"id":"...","ok":true,"result":"..."}` out. The
 operations are `ping`, `console <command>`, `vars <formid hex> <script>`, `player`, `ref <formid hex>` and
-`near <radius> [<base form type> [<x> <y> <z>]]` and `perf [<seconds>]`.
+`near <radius> [<base form type> [<x> <y> <z>]]`, `perf [<seconds>]`, `place <formid hex> [<distance>]` and
+`screenshot`.
 
 - `game_player`: the player's cell, position and rotation (degrees).
 - `game_ref`: one reference's base object and type, cell, position, rotation, disabled/deleted/3D state, and every
   linked ref (keyword → target), including links a script added at runtime.
-- `game_refs_near`: references within a radius of the player or a point, nearest first (up to 300), optionally only
+- `game_place`: places a new reference of a base object in front of the player, upright and turned the way the
+  player faces, and returns its FormID. Handy for looking at a new mesh in game.
+- `game_screenshot`: takes a screenshot through the game's own screenshot function and returns it. Set
+  `FO4_GAME_SCREENSHOTS` to the folder in the game's `sScreenShotBaseName` (`[Display]` in `Fallout4Prefs.ini` or
+  your custom ini), with `bAllowScreenshot=1`.
+- `game_refs_near`: references within a radius of the player or a point (in the interior cell, or across all loaded
+  exterior cells), nearest first (up to 300), optionally only
   those whose base is a given form type (`LIGH`, `STAT`, `CONT`...). Finds objects scripts spawned (`FF...` FormIDs).
 - `game_perf`: frame rate and frame times (mean, median, 99th percentile, worst) over 0.5 to 10 seconds, read from the
   engine's own frame timer. Compare runs from the same spot and facing, e.g. a room before and after a change. With
