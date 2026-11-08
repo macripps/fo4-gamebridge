@@ -1,8 +1,12 @@
 """MCP server for a running Fallout 4: talks to the GameBridge F4SE plugin, and reads the Papyrus logs.
 
-Log tools work with the game closed. Game tools need the game running with GameBridge.dll in Data/F4SE/Plugins.
-Needs the mcp package (2.x): pip install mcp
+Log and screenshot tools work with the game closed. Game tools need the game running with GameBridge.dll in
+Data/F4SE/Plugins. Needs the mcp package (2.x): pip install mcp. Pillow (optional) shrinks screenshots.
+Environment: WSFW_PREFIX (see below), FO4_SCREENSHOTS (folder the game's screenshots land in, e.g. Steam's
+userdata/<id>/760/remote/377160/screenshots).
 """
+import glob
+import io
 import json
 import os
 import re
@@ -10,7 +14,7 @@ import socket
 import threading
 import itertools
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 HOST, PORT = "127.0.0.1", 47830
@@ -21,6 +25,8 @@ LOGS = os.path.expanduser(r"~\Documents\My Games\Fallout4\Logs\Script")
 FIRST_RUNNER = int(os.environ.get("WSFW_PREFIX", "10"), 16) << 24 | 0x001737
 RUNNER_COUNT = 50
 RUNNER_SCRIPT = "workshopframework:mainthreadrunner"
+SCREENSHOTS = os.environ.get("FO4_SCREENSHOTS", "")
+SCREENSHOT_WIDTH = 1600
 
 mcp = MCPServer("fallout4")
 _lock = threading.Lock()
@@ -97,6 +103,58 @@ def game_script_vars(form_id: str, script: str) -> dict:
     """Read every variable of a script attached to a form, including private ones, e.g. form_id "10001761",
     script "workshopframework:mainthreadrunner". Values are live."""
     return _read_vars(form_id, script)
+
+
+@mcp.tool()
+def game_player() -> str:
+    """The player's cell, position (x y z) and rotation in degrees, live."""
+    return _call("player")
+
+
+@mcp.tool()
+def game_ref(form_id: str) -> str:
+    """One reference, live: base object and its form type, cell, position, rotation, disabled/deleted/3D-loaded, and
+    every linked ref (keyword -> target), including links a script added at runtime. form_id is the load-order
+    FormID in hex, e.g. "15004365" or a spawned "FF0020A3". Editor IDs show only where the game keeps them."""
+    return _call("ref", form_id)
+
+
+@mcp.tool()
+def game_refs_near(radius: float, form_type: str = "", x: float | None = None, y: float | None = None,
+                   z: float | None = None) -> str:
+    """References within radius of a point in the player's cell, nearest first (up to 300). The point defaults to
+    the player. form_type filters by the base's type, e.g. "LIGH", "STAT", "CONT", "ACTI", "FURN". Finds objects a
+    script spawned (FF... FormIDs); follow up with game_ref."""
+    parts = ["near", str(radius), form_type]
+    if x is not None and y is not None and z is not None:
+        parts += [str(x), str(y), str(z)]
+    return _call(*parts)
+
+
+@mcp.tool()
+def latest_screenshots(count: int = 1) -> list:
+    """The newest game screenshots (from FO4_SCREENSHOTS), newest first, shrunk to 1600 px wide when Pillow is
+    installed. Works with the game closed."""
+    if not SCREENSHOTS or not os.path.isdir(SCREENSHOTS):
+        raise ToolError("set FO4_SCREENSHOTS to the folder the game's screenshots are saved in")
+    files = sorted(glob.glob(os.path.join(SCREENSHOTS, "*.jpg")) + glob.glob(os.path.join(SCREENSHOTS, "*.png")),
+                   key=os.path.getmtime, reverse=True)[:max(1, min(count, 6))]
+    if not files:
+        raise ToolError(f"no screenshots in {SCREENSHOTS}")
+    out = []
+    for path in files:
+        out.append(os.path.basename(path))
+        try:
+            from PIL import Image as PILImage
+            with PILImage.open(path) as im:
+                if im.width > SCREENSHOT_WIDTH:
+                    im = im.resize((SCREENSHOT_WIDTH, round(im.height * SCREENSHOT_WIDTH / im.width)))
+                buffer = io.BytesIO()
+                im.convert("RGB").save(buffer, "JPEG", quality=85)
+            out.append(Image(data=buffer.getvalue(), format="jpeg"))
+        except ImportError:
+            out.append(Image(path=path))
+    return out
 
 
 @mcp.tool()

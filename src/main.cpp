@@ -7,12 +7,14 @@
 // Protocol, one line each way:
 //   request   id<TAB>op[<TAB>arg...]
 //   reply     {"id":"...","ok":true,"result":"..."}
-//   ops       ping | console <command> | vars <formid hex> <script>
+//   ops       ping | console <command> | vars <formid hex> <script> | player | ref <formid hex>
+//             | near <radius> [<base form type> [<x> <y> <z>]]
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #undef ERROR  // wingdi.h's ERROR breaks REX::ERROR
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <future>
@@ -194,6 +196,100 @@ namespace Bridge
         return { true, out };
     }
 
+    constexpr float kRadToDeg = 57.2957795f;
+
+    // "0001A2B3 EditorID [Plugin.esm] "Display name"": the editor ID only when the game kept it (many form types drop it
+    // at runtime), the plugin that defines the form (none for forms created in game, FF...), and the display name if any.
+    std::string Name(const RE::TESForm* a_form)
+    {
+        if (!a_form) {
+            return "None";
+        }
+        auto out = std::format("{:08X}", a_form->GetFormID());
+        if (const auto edid = a_form->GetFormEditorID(); edid && *edid) {
+            out += std::format(" {}", edid);
+        }
+        if (const auto file = a_form->GetFile(0)) {
+            out += std::format(" [{}]", file->GetFilename());
+        }
+        if (const auto full = RE::TESFullName::GetFullName(*a_form); !full.empty()) {
+            out += std::format(" \"{}\"", full);
+        }
+        return out;
+    }
+
+    std::string Where(const RE::TESObjectREFR* a_ref)
+    {
+        const auto& d = a_ref->data;
+        return std::format("pos {:.2f} {:.2f} {:.2f} rot {:.1f} {:.1f} {:.1f}", d.location.x, d.location.y, d.location.z,
+            d.angle.x * kRadToDeg, d.angle.y * kRadToDeg, d.angle.z * kRadToDeg);
+    }
+
+    // The player's cell, position and rotation (degrees). Replaces "save, then read the save".
+    Reply Player()
+    {
+        const auto player = RE::PlayerCharacter::GetSingleton();
+        if (!player) {
+            return { false, "no player" };
+        }
+        return { true, std::format("cell {}\n{}", Name(player->GetParentCell()), Where(player)) };
+    }
+
+    // One reference: base, place, state and every linked ref (keyword -> target), including ones added by script.
+    Reply RefInfo(const std::string& a_formID)
+    {
+        const auto ref = RE::TESForm::GetFormByID(static_cast<RE::TESFormID>(std::stoul(a_formID, nullptr, 16)));
+        const auto refr = ref ? ref->As<RE::TESObjectREFR>() : nullptr;
+        if (!refr) {
+            return { false, "no reference " + a_formID };
+        }
+
+        const auto base = refr->GetObjectReference();
+        std::string out = std::format("ref {}\nbase {} ({})\ncell {}\n{}\ndisabled {}, deleted {}, 3D loaded {}\n",
+            Name(refr), Name(base), base ? base->GetFormTypeString() : "?", Name(refr->GetParentCell()), Where(refr),
+            refr->IsDisabled(), refr->GetDelete(), refr->Get3D() != nullptr);
+
+        if (refr->extraList) {
+            if (const auto links = refr->extraList->GetByType<RE::ExtraLinkedRef>()) {
+                for (const auto& link : links->linkedRefs) {
+                    out += std::format("link {} -> {}{}\n", Name(link.keyword), Name(link.REFR),
+                        link.REFR && link.REFR->GetObjectReference() ? " (base " + Name(link.REFR->GetObjectReference()) + ")" : "");
+                }
+            }
+        }
+        return { true, out };
+    }
+
+    // References within a_radius of a point (default: the player) in the player's cell, nearest first. a_type filters by
+    // the base's form type ("LIGH", "STAT", "CONT", ...); empty means all.
+    Reply Near(float a_radius, const std::string& a_type, std::optional<RE::NiPoint3> a_origin)
+    {
+        const auto player = RE::PlayerCharacter::GetSingleton();
+        const auto cell = player ? player->GetParentCell() : nullptr;
+        if (!cell) {
+            return { false, "no player cell" };
+        }
+        const auto origin = a_origin.value_or(player->GetPosition());
+
+        std::vector<std::pair<float, std::string>> rows;
+        cell->ForEachReferenceInRange(origin, a_radius, [&](RE::TESObjectREFR* a_ref) {
+            const auto base = a_ref ? a_ref->GetObjectReference() : nullptr;
+            if (base && a_ref != player && (a_type.empty() || a_type == base->GetFormTypeString())) {
+                const auto distance = origin.GetDistance(a_ref->GetPosition());
+                rows.emplace_back(distance, std::format("{:08X} base {} ({}) dist {:.0f} {}{}", a_ref->GetFormID(), Name(base),
+                    base->GetFormTypeString(), distance, Where(a_ref), a_ref->IsDisabled() ? " DISABLED" : ""));
+            }
+            return RE::BSContainer::ForEachResult::kContinue;
+        });
+
+        std::ranges::sort(rows, {}, &std::pair<float, std::string>::first);
+        std::string out = std::format("{} references\n", rows.size());
+        for (std::size_t i = 0; i < rows.size() && i < 300; ++i) {
+            out += rows[i].second + "\n";
+        }
+        return { true, out };
+    }
+
     Reply Handle(const std::vector<std::string>& a_parts)
     {
         const auto& op = a_parts[1];
@@ -222,6 +318,35 @@ namespace Bridge
                     return Reply{ false, e.what() };
                 }
             });
+        }
+
+        if (op == "player") {
+            return OnMainThread([]() { return Player(); });
+        }
+
+        if (op == "ref" && a_parts.size() >= 3) {
+            const auto formID = a_parts[2];
+            return OnMainThread([formID]() {
+                try {
+                    return RefInfo(formID);
+                } catch (const std::exception& e) {
+                    return Reply{ false, e.what() };
+                }
+            });
+        }
+
+        if (op == "near" && a_parts.size() >= 3) {
+            try {
+                const auto radius = std::stof(a_parts[2]);
+                const auto type = a_parts.size() >= 4 ? a_parts[3] : std::string{};
+                std::optional<RE::NiPoint3> origin;
+                if (a_parts.size() >= 7) {
+                    origin = RE::NiPoint3{ std::stof(a_parts[4]), std::stof(a_parts[5]), std::stof(a_parts[6]) };
+                }
+                return OnMainThread([radius, type, origin]() { return Near(radius, type, origin); });
+            } catch (const std::exception& e) {
+                return Reply{ false, e.what() };
+            }
         }
 
         return { false, "unknown op: " + op };
