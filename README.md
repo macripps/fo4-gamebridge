@@ -12,16 +12,21 @@ It was built to debug Workshop Framework and Sim Settlements 2 scripts while the
 | Part | What it does |
 |---|---|
 | `GameBridge.dll` (`src/`) | F4SE plugin. Listens on `127.0.0.1:47830` on its own thread, so `ping` answers even when Papyrus is jammed. Anything that touches game state runs on the main thread through F4SE's task queue. |
-| `server.py` | MCP server that talks to the plugin. Its tools: `game_status`, `game_console`, `game_script_vars`, `game_player`, `game_ref`, `game_refs_near`, `game_place`, `game_screenshot`, `game_perf`, `wsfw_runners`, `papyrus_stacks`, `read_log`, `latest_screenshots`. |
+| `server.py` | MCP server that talks to the plugin. Its tools: `game_status`, `game_console`, `game_script_vars`, `game_player`, `game_ref`, `game_actor`, `game_refs_near`, `game_place`, `game_screenshot`, `game_perf`, `wsfw_runners`, `papyrus_stacks`, `read_log`, `latest_screenshots`. |
 
 The protocol is one line each way: `id<TAB>op[<TAB>arg...]` in, `{"id":"...","ok":true,"result":"..."}` out. The
-operations are `ping`, `console <command>`, `vars <formid hex> <script>`, `player`, `ref <formid hex>` and
+operations are `ping`, `console <command>`, `vars <formid hex> <script>`, `player`, `ref <formid hex>`, `actor <formid hex>`,
 `near <radius> [<base form type> [<x> <y> <z>]]`, `perf [<seconds>]`, `place <formid hex> [<distance>]` and
 `screenshot`.
 
 - `game_player`: the player's cell, position and rotation (degrees).
 - `game_ref`: one reference's base object and type, cell, position, rotation, disabled/deleted/3D state, and every
-  linked ref (keyword → target), including links a script added at runtime.
+  linked ref (keyword → target), including links a script added at runtime. For an actor whose 3D isn't loaded, the
+  position can be its editor position rather than where it is.
+- `game_actor`: one actor's life state, whether it's talking to the player, the AI package it's running and that
+  package's target, the furniture it's using or heading to (a sitting NPC is using a chair or sit marker), and its
+  equipped items. It reads data members only: calling some engine functions by vtable slot or address crashed
+  runtime 1.11.240.
 - `game_place`: places a new reference of a base object in front of the player, upright and turned the way the
   player faces, and returns its FormID. Handy for looking at a new mesh in game.
 - `game_screenshot`: takes a screenshot through the game's own screenshot function and returns it. Set

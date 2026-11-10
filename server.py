@@ -122,6 +122,15 @@ def game_ref(form_id: str) -> str:
 
 
 @mcp.tool()
+def game_actor(form_id: str) -> str:
+    """One actor, live: life state, disabled, talking to the player, the AI package it is running (with the
+    package's target), the furniture it is using or heading to (sitting = using a chair or sit marker), and the items
+    it has equipped. form_id is the load-order FormID of the actor reference (not its base NPC). An actor whose 3D
+    isn't loaded may show a stale position, and far-away actors have no furniture data."""
+    return _call("actor", form_id)
+
+
+@mcp.tool()
 def game_refs_near(radius: float, form_type: str = "", x: float | None = None, y: float | None = None,
                    z: float | None = None) -> str:
     """References within radius of a point in the player's cell, nearest first (up to 300). The point defaults to

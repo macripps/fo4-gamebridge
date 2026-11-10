@@ -7,7 +7,7 @@
 // Protocol, one line each way:
 //   request   id<TAB>op[<TAB>arg...]
 //   reply     {"id":"...","ok":true,"result":"..."}
-//   ops       ping | console <command> | vars <formid hex> <script> | player | ref <formid hex>
+//   ops       ping | console <command> | vars <formid hex> <script> | player | ref <formid hex> | actor <formid hex>
 //             | near <radius> [<base form type> [<x> <y> <z>]] | perf [<seconds>] | place <formid hex> [<distance>]
 //             | screenshot
 
@@ -261,6 +261,65 @@ namespace Bridge
         return { true, out };
     }
 
+    // One actor's AI and appearance: life state, talking to the player, the furniture it is using, the AI package it
+    // is running (and that package's target), and the items it has equipped. Replaces screenshots and guessing.
+    // Reads data members only. The first version also called virtual functions (IsInCombat, IsTalking,
+    // DoGetSitSleepState) and AIProcess::GetOccupiedFurniture by address; the game crashed soon after (2026-11-10, no
+    // crash log), so a vtable slot or address was probably wrong for 1.11.240. Don't add calls here without testing.
+    Reply ActorInfo(const std::string& a_formID)
+    {
+        const auto form = RE::TESForm::GetFormByID(static_cast<RE::TESFormID>(std::stoul(a_formID, nullptr, 16)));
+        const auto actor = form ? form->As<RE::Actor>() : nullptr;
+        if (!actor) {
+            return { false, "no actor reference " + a_formID };
+        }
+
+        static constexpr const char* kLife[] = { "alive", "dying", "dead", "unconscious", "reanimate", "recycle",
+            "restrained", "essential down", "bleedout" };
+
+        const bool loaded = actor->Get3D() != nullptr;
+        std::string out = std::format("actor {}\nbase {}\ncell {}\n{}{}\n", Name(actor), Name(actor->GetObjectReference()),
+            Name(actor->GetParentCell()), Where(actor), loaded ? "" : " (3D not loaded: the position may be stale)");
+
+        const auto life = static_cast<std::uint32_t>(actor->lifeState);
+        out += std::format("life {}, disabled {}, talking to player {}\n",
+            life < std::size(kLife) ? kLife[life] : std::to_string(life), actor->IsDisabled(), actor->talkingToPlayer != 0);
+
+        const auto refLine = [](const char* a_label, const RE::ObjectRefHandle& a_handle) {
+            const auto ref = a_handle.get();
+            return ref ? std::format("{} {} (base {}) {}\n", a_label, Name(ref.get()), Name(ref->GetObjectReference()), Where(ref.get())) :
+                         std::string{};
+        };
+
+        if (const auto process = actor->currentProcess) {
+            const auto& current = process->currentPackage;
+            out += std::format("package {}\n", Name(current.package));
+            out += refLine("package target", current.target);
+            if (const auto high = process->middleHigh) {
+                out += refLine("using furniture", high->occupiedFurniture);
+                out += refLine("heading to furniture", high->currentFurniture);
+            } else {
+                out += "low process (far away): no furniture data\n";
+            }
+        } else {
+            out += "no AI process (the actor isn't being processed)\n";
+        }
+
+        std::string worn;
+        if (const auto inventory = actor->inventoryList) {
+            for (const auto& item : inventory->data) {
+                for (auto stack = item.stackData.get(); stack; stack = stack->nextStack.get()) {
+                    if (stack->IsEquipped()) {
+                        worn += std::format("  {} ({})\n", Name(item.object), item.object ? item.object->GetFormTypeString() : "?");
+                        break;
+                    }
+                }
+            }
+        }
+        out += worn.empty() ? "equipped: nothing\n" : "equipped:\n" + worn;
+        return { true, out };
+    }
+
     // References within a_radius of a point (default: the player), in the player's interior cell or the loaded exterior
     // cells, nearest first. a_type filters by
     // the base's form type ("LIGH", "STAT", "CONT", ...); empty means all.
@@ -445,6 +504,17 @@ namespace Bridge
             return OnMainThread([formID]() {
                 try {
                     return RefInfo(formID);
+                } catch (const std::exception& e) {
+                    return Reply{ false, e.what() };
+                }
+            });
+        }
+
+        if (op == "actor" && a_parts.size() >= 3) {
+            const auto formID = a_parts[2];
+            return OnMainThread([formID]() {
+                try {
+                    return ActorInfo(formID);
                 } catch (const std::exception& e) {
                     return Reply{ false, e.what() };
                 }
