@@ -9,7 +9,7 @@
 //   reply     {"id":"...","ok":true,"result":"..."}
 //   ops       ping | console <command> | vars <formid hex> <script> | player | ref <formid hex> | actor <formid hex>
 //             | near <radius> [<base form type> [<x> <y> <z>]] | perf [<seconds>] | place <formid hex> [<distance>]
-//             | screenshot
+//             | screenshot | quest <formid hex or editor ID> | questlog [<count>] | global <formid hex or editor ID>
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -17,7 +17,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
+#include <deque>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -403,6 +405,146 @@ namespace Bridge
                                              Reply{ false, "a screenshot is already queued, or screenshots are off" };
     }
 
+    // A form by load-order FormID (8 hex digits) or editor ID (forms that keep theirs at runtime: quests, globals...).
+    RE::TESForm* FindForm(const std::string& a_name)
+    {
+        if (a_name.size() == 8 && std::ranges::all_of(a_name, [](unsigned char c) { return std::isxdigit(c) != 0; })) {
+            return RE::TESForm::GetFormByID(static_cast<RE::TESFormID>(std::stoul(a_name, nullptr, 16)));
+        }
+        return RE::TESForm::GetFormByEditorID(RE::BSFixedString{ a_name.c_str() });
+    }
+
+    // Quest stage and start/stop events from the engine, newest last, whether or not any script hears them (a stage
+    // with no log entry sets but sends Papyrus no OnStageSet). Kept from game start, across loads.
+    constexpr std::size_t kQuestLogSize = 500;
+    std::mutex            questLogLock;
+    struct QuestLogEntry
+    {
+        RE::TESFormID quest{ 0 };
+        std::string   text;
+    };
+    std::deque<QuestLogEntry> questLog;
+
+    void AddQuestLog(RE::TESFormID a_quest, const std::string& a_what)
+    {
+        SYSTEMTIME now{};
+        GetLocalTime(&now);
+        auto line = std::format("{:02}:{:02}:{:02}.{:03} {} {}", now.wHour, now.wMinute, now.wSecond, now.wMilliseconds,
+            Name(RE::TESForm::GetFormByID(a_quest)), a_what);
+        const std::lock_guard lock{ questLogLock };
+        questLog.push_back({ a_quest, std::move(line) });
+        if (questLog.size() > kQuestLogSize) {
+            questLog.pop_front();
+        }
+    }
+
+    class QuestEvents final :
+        public RE::BSTEventSink<RE::TESQuestStageEvent>,
+        public RE::BSTEventSink<RE::TESQuestStartStopEvent>
+    {
+    public:
+        RE::BSEventNotifyControl ProcessEvent(const RE::TESQuestStageEvent& a_event, RE::BSTEventSource<RE::TESQuestStageEvent>*) override
+        {
+            AddQuestLog(a_event.questFormID, std::format("stage {} (log entry {})", a_event.stageID, a_event.itemID));
+            return RE::BSEventNotifyControl::kContinue;
+        }
+
+        RE::BSEventNotifyControl ProcessEvent(const RE::TESQuestStartStopEvent& a_event, RE::BSTEventSource<RE::TESQuestStartStopEvent>*) override
+        {
+            AddQuestLog(a_event.questFormID, a_event.started ? "started" : (a_event.failed ? "stopped (failed)" : "stopped"));
+            return RE::BSEventNotifyControl::kContinue;
+        }
+    };
+    QuestEvents questEvents;
+
+    std::string QuestLogLines(RE::TESFormID a_quest, std::size_t a_count)
+    {
+        const std::lock_guard lock{ questLogLock };
+        std::vector<const std::string*> lines;
+        for (auto it = questLog.rbegin(); it != questLog.rend() && lines.size() < a_count; ++it) {
+            if (!a_quest || it->quest == a_quest) {
+                lines.push_back(&it->text);
+            }
+        }
+        std::string out;
+        for (auto it = lines.rbegin(); it != lines.rend(); ++it) {
+            out += **it + "\n";
+        }
+        return out;
+    }
+
+    // A quest's state: run flags, current stage, objectives (live state and text), aliases and what each holds, and
+    // this session's stage events for it. Which stages are done isn't readable (TESQuestStage's layout isn't known),
+    // but the current stage is the last one set. Data members only, plus TESQuest::GetAliasedRef.
+    Reply QuestInfo(const std::string& a_name)
+    {
+        const auto form = FindForm(a_name);
+        const auto quest = form ? form->As<RE::TESQuest>() : nullptr;
+        if (!quest) {
+            return { false, "no quest " + a_name };
+        }
+
+        static constexpr std::pair<std::uint16_t, const char*> kQuestFlags[] = { { 0x1, "running" }, { 0x2, "completed" },
+            { 0x40, "failed" }, { 0x80, "stage wait" }, { 0x100, "run once" }, { 0x800, "active (tracked)" } };
+        const auto  flags = quest->data.flags;
+        std::string flagText;
+        for (const auto& [bit, label] : kQuestFlags) {
+            if (flags & bit) {
+                flagText += flagText.empty() ? label : std::string{ ", " } + label;
+            }
+        }
+        std::string out = std::format("quest {}\nflags {:04X}: {}\ncurrent stage {}, already run {}\n", Name(quest), flags,
+            flagText.empty() ? "not running" : flagText, quest->currentStage, quest->alreadyRun);
+
+        static constexpr const char* kStates[] = { "dormant", "displayed", "completed", "completed (displayed)", "failed",
+            "failed (displayed)" };
+        std::vector<const RE::BGSQuestObjective*> objectives;
+        for (const auto objective : quest->objectives) {
+            if (objective) {
+                objectives.push_back(objective);
+            }
+        }
+        std::ranges::sort(objectives, {}, &RE::BGSQuestObjective::index);
+        out += std::format("objectives ({}):\n", objectives.size());
+        for (const auto objective : objectives) {
+            const auto state = static_cast<unsigned char>(objective->state);
+            out += std::format("  {} {} \"{}\"\n", objective->index, state < std::size(kStates) ? kStates[state] : std::to_string(state),
+                objective->displayText.c_str() ? objective->displayText.c_str() : "");
+        }
+
+        static constexpr std::pair<std::uint32_t, const char*> kAliasFlags[] = { { 1u << 1, "optional" },
+            { 1u << 2, "quest object" }, { 1u << 6, "essential" }, { 1u << 7, "allow disabled" }, { 1u << 10, "protected" } };
+        out += std::format("aliases ({}):\n", quest->aliases.size());
+        for (const auto alias : quest->aliases) {
+            if (!alias) {
+                continue;
+            }
+            std::string aliasFlags;
+            for (const auto& [bit, label] : kAliasFlags) {
+                if (alias->flags.underlying() & bit) {
+                    aliasFlags += std::string{ ", " } + label;
+                }
+            }
+            const auto ref = quest->GetAliasedRef(alias->aliasID).get();
+            out += std::format("  {} {}{} -> {}\n", alias->aliasID, alias->aliasName.c_str(), aliasFlags,
+                ref ? Name(ref.get()) + (ref->IsDisabled() ? " DISABLED" : "") : "(empty, or not a reference alias)");
+        }
+
+        const auto events = QuestLogLines(quest->GetFormID(), 50);
+        out += events.empty() ? "stage events this session: none\n" : "stage events this session:\n" + events;
+        return { true, out };
+    }
+
+    Reply GlobalValue(const std::string& a_name)
+    {
+        const auto form = FindForm(a_name);
+        const auto global = form ? form->As<RE::TESGlobal>() : nullptr;
+        if (!global) {
+            return { false, "no global " + a_name };
+        }
+        return { true, std::format("{} = {}", Name(global), global->GetValue()) };
+    }
+
     // Frame times over a_seconds of wall time. Runs on the network thread: it queues one main-thread task at a time,
     // each reading the engine's own timer (BSTimer: realTimeDelta is the last frame's length, lastTime its timestamp),
     // and keeps one sample per distinct frame.
@@ -555,6 +697,38 @@ namespace Bridge
             return OnMainThread([]() { return Screenshot(); });
         }
 
+        if (op == "quest" && a_parts.size() >= 3) {
+            const auto name = a_parts[2];
+            return OnMainThread([name]() {
+                try {
+                    return QuestInfo(name);
+                } catch (const std::exception& e) {
+                    return Reply{ false, e.what() };
+                }
+            });
+        }
+
+        if (op == "questlog") {
+            try {
+                const auto count = a_parts.size() >= 3 ? std::stoul(a_parts[2]) : 50ul;
+                const auto lines = QuestLogLines(0, std::clamp<std::size_t>(count, 1, kQuestLogSize));
+                return { true, lines.empty() ? "no quest events since the game started\n" : lines };
+            } catch (const std::exception& e) {
+                return Reply{ false, e.what() };
+            }
+        }
+
+        if (op == "global" && a_parts.size() >= 3) {
+            const auto name = a_parts[2];
+            return OnMainThread([name]() {
+                try {
+                    return GlobalValue(name);
+                } catch (const std::exception& e) {
+                    return Reply{ false, e.what() };
+                }
+            });
+        }
+
         if (op == "perf") {
             try {
                 const auto seconds = a_parts.size() >= 3 ? std::stof(a_parts[2]) : 3.0f;
@@ -639,6 +813,12 @@ namespace Bridge
     void OnMessage(F4SE::MessagingInterface::Message* a_message)
     {
         if (a_message->type == F4SE::MessagingInterface::kGameDataReady) {
+            if (const auto stages = RE::TESQuestStageEvent::GetEventSource()) {
+                stages->RegisterSink(&questEvents);
+            }
+            if (const auto startStop = RE::TESQuestStartStopEvent::GetEventSource()) {
+                startStop->RegisterSink(&questEvents);
+            }
             gameDataReady = true;
         }
     }

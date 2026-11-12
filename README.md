@@ -12,12 +12,12 @@ It was built to debug Workshop Framework and Sim Settlements 2 scripts while the
 | Part | What it does |
 |---|---|
 | `GameBridge.dll` (`src/`) | F4SE plugin. Listens on `127.0.0.1:47830` on its own thread, so `ping` answers even when Papyrus is jammed. Anything that touches game state runs on the main thread through F4SE's task queue. |
-| `server.py` | MCP server that talks to the plugin. Its tools: `game_status`, `game_console`, `game_script_vars`, `game_player`, `game_ref`, `game_actor`, `game_refs_near`, `game_place`, `game_screenshot`, `game_perf`, `wsfw_runners`, `papyrus_stacks`, `read_log`, `latest_screenshots`. |
+| `server.py` | MCP server that talks to the plugin. Its tools: `game_status`, `game_console`, `game_script_vars`, `game_player`, `game_ref`, `game_actor`, `game_refs_near`, `game_place`, `game_screenshot`, `game_perf`, `game_quest`, `game_quest_events`, `game_global`, `wsfw_runners`, `papyrus_stacks`, `read_log`, `latest_screenshots`. |
 
 The protocol is one line each way: `id<TAB>op[<TAB>arg...]` in, `{"id":"...","ok":true,"result":"..."}` out. The
 operations are `ping`, `console <command>`, `vars <formid hex> <script>`, `player`, `ref <formid hex>`, `actor <formid hex>`,
-`near <radius> [<base form type> [<x> <y> <z>]]`, `perf [<seconds>]`, `place <formid hex> [<distance>]` and
-`screenshot`.
+`near <radius> [<base form type> [<x> <y> <z>]]`, `perf [<seconds>]`, `place <formid hex> [<distance>]`,
+`screenshot`, `quest <formid hex or editor ID>`, `questlog [<count>]` and `global <formid hex or editor ID>`.
 
 - `game_player`: the player's cell, position and rotation (degrees).
 - `game_ref`: one reference's base object and type, cell, position, rotation, disabled/deleted/3D state, and every
@@ -38,6 +38,14 @@ operations are `ping`, `console <command>`, `vars <formid hex> <script>`, `playe
 - `game_perf`: frame rate and frame times (mean, median, 99th percentile, worst) over 0.5 to 10 seconds, read from the
   engine's own frame timer. Compare runs from the same spot and facing, e.g. a room before and after a change. With
   vsync on, a cost shows first in the 99th percentile and worst frames.
+- `game_quest`: one quest's run flags, current stage (the highest set), objectives with their live state and text,
+  aliases with their flags and the reference each holds, and the stage events seen for it this session. Which earlier
+  stages are done isn't readable.
+- `game_quest_events`: the latest quest stage and start/stop events from the engine (up to 500 since the game
+  started), with times. They come from the engine, not Papyrus, but a stage with no log entry sends none: it's set
+  silently, and Papyrus `OnStageSet` doesn't fire for it either. Give every stage a script reacts to a log entry, even
+  an empty one.
+- `game_global`: a global variable's value.
 
 Forms print as `FormID EditorID [Plugin.esm] "Display name"`: the editor ID only where the game keeps it at runtime
 (keywords, quests), the defining plugin (none for forms created in game), and the display name if there is one.

@@ -151,6 +151,30 @@ def game_place(form_id: str, distance: float = 200.0) -> str:
 
 
 @mcp.tool()
+def game_quest(quest: str) -> str:
+    """One quest, live: running/completed/failed flags, the current stage (the last one set), every objective with
+    its state (dormant, displayed, completed...) and text, every alias with its flags and the reference it holds, and
+    the stage events GameBridge has seen for it this session. quest is the editor ID (e.g. "AIMUS_MoSS_Unlock") or the
+    load-order FormID in hex. Which earlier stages are done isn't readable; see game_quest_events."""
+    return _call("quest", quest)
+
+
+@mcp.tool()
+def game_quest_events(count: int = 50) -> str:
+    """The latest quest events from the engine (up to 500 since the game started, across loads), oldest first, with
+    the time: "stage N (log entry M)", "started", "stopped". They come from the engine, not Papyrus, so they show stages
+    set even when no script hears them; a stage with no log entry may send no event at all."""
+    return _call("questlog", str(count))
+
+
+@mcp.tool()
+def game_global(name: str) -> str:
+    """A global variable's current value, by editor ID (e.g. "AIMUS_MoSS_ActionAvailable_CleanRoom_3rdFloorSmallOffice")
+    or load-order FormID in hex. Set one with game_console ("set <name> to <value>")."""
+    return _call("global", name)
+
+
+@mcp.tool()
 def game_screenshot() -> list:
     """Take a game screenshot (as the screenshot key does) and return it. Needs FO4_GAME_SCREENSHOTS set to the
     folder in the game's sScreenShotBaseName (Fallout4Prefs.ini, [Display]), and bAllowScreenshot=1."""
