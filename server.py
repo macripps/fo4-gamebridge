@@ -174,6 +174,58 @@ def game_global(name: str) -> str:
     return _call("global", name)
 
 
+def _loads():
+    """(load count, reply text) from the plugin, or None if the game isn't reachable."""
+    try:
+        text = _call("loads")
+    except ToolError:
+        return None
+    return int(text.splitlines()[0].split()[1]), text
+
+
+@mcp.tool()
+def game_wait_for_load(timeout: float = 900.0, next: bool = False) -> str:
+    """Wait until a save is loaded, then return the save's name and time. If one is already loaded, returns at once;
+    next=True waits for the next load instead (e.g. after asking for a different save). Waits for the game to start
+    first if it isn't running. Use it instead of asking the user to say when they've loaded. Polls every 2 s, up to
+    timeout seconds."""
+    start = _loads()
+    if start and start[0] > 0 and not next:
+        return start[1] + "\n(already loaded)"
+    baseline = start[0] if start else 0
+    deadline = time.monotonic() + timeout
+    was_up = start is not None
+    while time.monotonic() < deadline:
+        time.sleep(2)
+        now = _loads()
+        if now is None:
+            if was_up:
+                baseline, was_up = 0, False  # the game quit: after a restart the count starts again at 0
+            continue
+        was_up = True
+        if now[0] > baseline:
+            return now[1]
+    raise ToolError(f"no save loaded within {timeout:.0f} s")
+
+
+@mcp.tool()
+def game_move(form_id: str, to: str = "", offset: str = "", rotation: str = "") -> str:
+    """Move and/or turn a reference, as the console's prid + setpos + setangle in one step (the selection can't change
+    in between; 3D and collision update). to: "x,y,z" absolute. offset: "forward,right,up" in the reference's own
+    frame (by its rotation Z), applied after to, e.g. "0,0,5" raises it 5, "-3,0,0" moves it 3 back. rotation: "x,y,z"
+    degrees. Returns the position and rotation before and after. Like setpos, the change is kept in the save."""
+    return _call("move", form_id, to or "-", offset or "-", rotation or "-")
+
+
+@mcp.tool()
+def game_crosshair(range: float = 1000.0) -> str:
+    """What the view ray hits first, as the game's own pick would: casts from the camera (the free camera in free
+    mode, otherwise the player's aim) up to range units through the physics world, skipping the player's own
+    collision. Returns the hit point, its distance, the 3D node hit and the reference that owns it. Use it when something can't be activated: if the hit isn't the activator, that reference's
+    collision is in front of it. Third person: the ray starts at the camera but follows the player's aim."""
+    return _call("crosshair", str(range))
+
+
 @mcp.tool()
 def game_camera(action: str = "status") -> str:
     """The free camera (as the console's tfc). action: "status" (camera state; in free mode its position, yaw and

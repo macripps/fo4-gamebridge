@@ -42,6 +42,22 @@ namespace Bridge
     std::atomic_bool gameDataReady{ false };
     std::string      runtimeVersion;
 
+    // Save loads, from F4SE's kPreLoadGame (the save's name) and kPostLoadGame/kNewGame (done). The "loads" op reports
+    // them so a client can wait for the next load instead of being told.
+    std::atomic_uint32_t loadCount{ 0 };
+    std::mutex           loadLock;
+    std::string          loadingSave;
+    std::string          lastLoad;
+    bool                 lastLoadOk{ false };
+    std::string          lastLoadTime;
+
+    std::string Clock()
+    {
+        SYSTEMTIME now{};
+        GetLocalTime(&now);
+        return std::format("{:02}:{:02}:{:02}", now.wHour, now.wMinute, now.wSecond);
+    }
+
     struct Reply
     {
         bool        ok{ false };
@@ -879,6 +895,123 @@ namespace Bridge
         return { false, "camera: status | free | release | stop | look | fly | orbit | path" };
     }
 
+    // ---------------------------------------------------------------- move
+
+    // Moves and/or turns a reference: a_to is "x,y,z" (absolute) or empty; a_offset is "forward,right,up" in the
+    // reference's own frame (by its rotation Z), applied after a_to; a_rotation is "x,y,z" in degrees or empty. Runs
+    // "<ref>.setpos" and "<ref>.setangle", which need no console selection, in one main-thread task; the engine
+    // updates the 3D and collision as for the console. Like setpos, the change is kept in the save.
+    Reply Move(const std::string& a_formID, const std::string& a_to, const std::string& a_offset, const std::string& a_rotation)
+    {
+        const auto form = FindForm(a_formID);
+        const auto ref = form ? form->As<RE::TESObjectREFR>() : nullptr;
+        if (!ref) {
+            return { false, "no reference " + a_formID };
+        }
+        if (ref == RE::PlayerCharacter::GetSingleton()) {
+            return { false, "use the console to move the player" };
+        }
+        const auto triple = [](const std::string& a_text, const char* a_what) {
+            const auto parts = Split(a_text, ',');
+            if (parts.size() != 3) {
+                throw std::runtime_error(std::format("{} must be three numbers a,b,c: \"{}\"", a_what, a_text));
+            }
+            return RE::NiPoint3{ std::stof(parts[0]), std::stof(parts[1]), std::stof(parts[2]) };
+        };
+
+        const auto before = std::format("before: {}", Where(ref));
+        RE::NiPoint3 pos = ref->GetPosition();
+        if (!a_to.empty()) {
+            pos = triple(a_to, "to");
+        }
+        float yaw = ref->data.angle.z;
+        RE::NiPoint3 angles{ ref->data.angle.x / kDeg, ref->data.angle.y / kDeg, ref->data.angle.z / kDeg };
+        if (!a_rotation.empty()) {
+            angles = triple(a_rotation, "rotation");
+            yaw = angles.z * kDeg;
+        }
+        if (!a_offset.empty()) {
+            const auto o = triple(a_offset, "offset");  // forward, right, up
+            pos.x += std::sin(yaw) * o.x + std::cos(yaw) * o.y;
+            pos.y += std::cos(yaw) * o.x - std::sin(yaw) * o.y;
+            pos.z += o.z;
+        }
+
+        // "<ref>.setpos" names the reference in each command: a prid in the same task only takes effect a frame later
+        // (tested 2026-11-13: prid then setpos in one task moved nothing; as separate calls, or with "ref.", it works).
+        const auto id = std::format("{:08X}", ref->GetFormID());
+        RE::Console::ExecuteCommand(std::format("{}.setpos x {:.2f}", id, pos.x).c_str());
+        RE::Console::ExecuteCommand(std::format("{}.setpos y {:.2f}", id, pos.y).c_str());
+        RE::Console::ExecuteCommand(std::format("{}.setpos z {:.2f}", id, pos.z).c_str());
+        if (!a_rotation.empty()) {
+            RE::Console::ExecuteCommand(std::format("{}.setangle x {:.2f}", id, angles.x).c_str());
+            RE::Console::ExecuteCommand(std::format("{}.setangle y {:.2f}", id, angles.y).c_str());
+            RE::Console::ExecuteCommand(std::format("{}.setangle z {:.2f}", id, angles.z).c_str());
+        }
+        // The console applies setpos on a later frame: the caller reads "after" in a second main-thread task.
+        return { true, std::format("{}\ntarget: pos {:.2f} {:.2f} {:.2f}", before, pos.x, pos.y, pos.z) };
+    }
+
+    // ---------------------------------------------------------------- crosshair
+
+    // What the view ray hits first: casts from the camera along the view (the free camera's pose in free mode,
+    // otherwise the player's aim) through the physics world, like the game's own pick, and reports the hit point,
+    // distance, the 3D node it hit and the reference that owns it. Shows when collision you can't see covers an
+    // activator. Calls bhkPickData and TESObjectCELL::Pick by address (non-virtual, as CreateReferenceAtLocation).
+    Reply Crosshair(float a_range)
+    {
+        const auto player = RE::PlayerCharacter::GetSingleton();
+        const auto camera = RE::PlayerCamera::GetSingleton();
+        const auto cell = player ? player->GetParentCell() : nullptr;
+        if (!player || !camera || !cell || !camera->cameraRoot) {
+            return { false, "no player, cell or camera" };
+        }
+
+        RE::NiPoint3 start = camera->cameraRoot->world.translate;
+        float        yaw = player->data.angle.z;
+        float        pitch = player->data.angle.x;
+        const char*  source = "player aim";
+        if (const auto state = FreeCamera()) {
+            const auto pose = ReadPose(state);
+            start = pose.pos;
+            yaw = pose.yaw;
+            pitch = pose.pitch;
+            source = "free camera";
+        }
+        const RE::NiPoint3 dir{ std::sin(yaw) * std::cos(pitch), std::cos(yaw) * std::cos(pitch), -std::sin(pitch) };
+
+        std::string out = std::format("from {} at {:.0f} {:.0f} {:.0f}, yaw {:.1f}, pitch {:.1f}\n", source, start.x,
+            start.y, start.z, yaw / kDeg, pitch / kDeg);
+
+        // Skip the player's own collision (the camera sits inside it): restart just past any hit on the player.
+        RE::NiPoint3 from = start;
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            const RE::NiPoint3 to = start + dir * a_range;
+            RE::bhkPickData    pick;
+            pick.SetStartEnd(from, to);
+            const auto node = cell->Pick(pick);
+            if (!pick.HasHit()) {
+                return { true, out + std::format("no hit within {:.0f}", a_range) };
+            }
+            const auto hit = from + (to - from) * pick.GetHitFraction();
+            const auto ref = node ? RE::TESObjectREFR::FindReferenceFor3D(node) : nullptr;
+            if (ref && ref == player) {
+                from = hit + dir * 2.0f;
+                continue;
+            }
+            const auto distance = (hit - start).Length();
+            out += std::format("hit at {:.1f} {:.1f} {:.1f}, distance {:.1f}\n", hit.x, hit.y, hit.z, distance);
+            out += std::format("node \"{}\"\n", node ? node->name.c_str() : "");
+            if (ref) {
+                out += std::format("ref {}\nbase {}\n{}\n", Name(ref), Name(ref->GetObjectReference()), Where(ref));
+            } else {
+                out += "ref none (terrain, or collision with no reference)\n";
+            }
+            return { true, out };
+        }
+        return { true, out + "only the player's own collision was hit" };
+    }
+
     // Frame times over a_seconds of wall time. Runs on the network thread: it queues one main-thread task at a time,
     // each reading the engine's own timer (BSTimer: realTimeDelta is the last frame's length, lastTime its timestamp),
     // and keeps one sample per distinct frame.
@@ -948,6 +1081,13 @@ namespace Bridge
         if (op == "ping") {
             return { true, std::format("GameBridge {}, runtime {}, game data {}", PLUGIN_VERSION_MAJOR,
                                runtimeVersion, gameDataReady ? "ready" : "not ready") };
+        }
+
+        // Answers before game data is ready too: the MCP server polls it to wait for a save to finish loading.
+        if (op == "loads") {
+            std::lock_guard lock{ loadLock };
+            return { true, std::format("loads {}\nlast {}\nok {}\nat {}", loadCount.load(),
+                               lastLoad.empty() ? "(none)" : lastLoad, lastLoadOk, lastLoadTime.empty() ? "-" : lastLoadTime) };
         }
 
         if (!gameDataReady) {
@@ -1074,6 +1214,50 @@ namespace Bridge
             });
         }
 
+        if (op == "move" && a_parts.size() >= 3) {
+            const auto arg = [&](std::size_t i) { return i < a_parts.size() && a_parts[i] != "-" ? a_parts[i] : std::string{}; };
+            const auto id = a_parts[2];
+            const auto to = arg(3);
+            const auto offset = arg(4);
+            const auto rotation = arg(5);
+            const auto moved = OnMainThread([id, to, offset, rotation]() {
+                try {
+                    return Move(id, to, offset, rotation);
+                } catch (const std::exception& e) {
+                    return Reply{ false, e.what() };
+                }
+            });
+            if (!moved.ok) {
+                return moved;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));  // a few frames: setpos lands on a later one
+            const auto after = OnMainThread([id]() {
+                const auto form = FindForm(id);
+                const auto ref = form ? form->As<RE::TESObjectREFR>() : nullptr;
+                return ref ? Reply{ true, "after:  " + Where(ref) } : Reply{ false, "reference gone" };
+            });
+            return { true, moved.text + "\n" + after.text +
+                               "\n(kept in the save, like setpos: don't save a game you want the plugin's position in)" };
+        }
+
+        if (op == "crosshair") {
+            float range = 1000.0f;
+            try {
+                if (a_parts.size() >= 3) {
+                    range = std::clamp(std::stof(a_parts[2]), 10.0f, 10000.0f);
+                }
+            } catch (const std::exception&) {
+                return { false, "range must be a number" };
+            }
+            return OnMainThread([range]() {
+                try {
+                    return Crosshair(range);
+                } catch (const std::exception& e) {
+                    return Reply{ false, e.what() };
+                }
+            });
+        }
+
         if (op == "perf") {
             try {
                 const auto seconds = a_parts.size() >= 3 ? std::stof(a_parts[2]) : 3.0f;
@@ -1157,7 +1341,22 @@ namespace Bridge
 
     void OnMessage(F4SE::MessagingInterface::Message* a_message)
     {
-        if (a_message->type == F4SE::MessagingInterface::kGameDataReady) {
+        using Messaging = F4SE::MessagingInterface;
+        if (a_message->type == Messaging::kPreLoadGame && a_message->data) {
+            std::lock_guard lock{ loadLock };
+            loadingSave.assign(static_cast<const char*>(a_message->data), a_message->dataLen);
+            loadingSave = loadingSave.c_str();  // drop a trailing null counted in dataLen
+        }
+        if (a_message->type == Messaging::kPostLoadGame || a_message->type == Messaging::kNewGame) {
+            {
+                std::lock_guard lock{ loadLock };
+                lastLoad = a_message->type == Messaging::kNewGame ? std::string{ "(new game)" } : loadingSave;
+                lastLoadOk = a_message->type == Messaging::kNewGame || reinterpret_cast<std::uintptr_t>(a_message->data) != 0;
+                lastLoadTime = Clock();
+            }
+            ++loadCount;
+        }
+        if (a_message->type == Messaging::kGameDataReady) {
             if (const auto stages = RE::TESQuestStageEvent::GetEventSource()) {
                 stages->RegisterSink(&questEvents);
             }

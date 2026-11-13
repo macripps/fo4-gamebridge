@@ -12,14 +12,15 @@ It was built to debug Workshop Framework and Sim Settlements 2 scripts while the
 | Part | What it does |
 |---|---|
 | `GameBridge.dll` (`src/`) | F4SE plugin. Listens on `127.0.0.1:47830` on its own thread, so `ping` answers even when Papyrus is jammed. Anything that touches game state runs on the main thread through F4SE's task queue. |
-| `server.py` | MCP server that talks to the plugin. Its tools: `game_status`, `game_console`, `game_script_vars`, `game_player`, `game_ref`, `game_actor`, `game_refs_near`, `game_place`, `game_screenshot`, `game_perf`, `game_quest`, `game_quest_events`, `game_global`, `game_camera`, `game_camera_look`, `game_camera_fly`, `game_camera_orbit`, `game_camera_path`, `wsfw_runners`, `papyrus_stacks`, `read_log`, `latest_screenshots`. |
+| `server.py` | MCP server that talks to the plugin. Its tools: `game_status`, `game_console`, `game_script_vars`, `game_player`, `game_ref`, `game_actor`, `game_refs_near`, `game_place`, `game_screenshot`, `game_perf`, `game_quest`, `game_quest_events`, `game_global`, `game_camera`, `game_camera_look`, `game_camera_fly`, `game_camera_orbit`, `game_camera_path`, `game_crosshair`, `game_move`, `game_wait_for_load`, `wsfw_runners`, `papyrus_stacks`, `read_log`, `latest_screenshots`. |
 
 The protocol is one line each way: `id<TAB>op[<TAB>arg...]` in, `{"id":"...","ok":true,"result":"..."}` out. The
 operations are `ping`, `console <command>`, `vars <formid hex> <script>`, `player`, `ref <formid hex>`, `actor <formid hex>`,
 `near <radius> [<base form type> [<x> <y> <z>]]`, `perf [<seconds>]`, `place <formid hex> [<distance>]`,
-`screenshot`, `quest <formid hex or editor ID>`, `questlog [<count>]`, `global <formid hex or editor ID>` and
+`screenshot`, `quest <formid hex or editor ID>`, `questlog [<count>]`, `global <formid hex or editor ID>`,
 `camera <subcommand> [<arg>...]` (`status`, `free`, `release`, `stop`, `look`, `fly`, `orbit`, `path`; a point is
-`x,y,z` or a reference's FormID).
+`x,y,z` or a reference's FormID), `crosshair [<range>]`, `move <formid> <to|-> <offset|-> <rotation|->` and `loads`
+(answered before game data is ready too).
 
 - `game_player`: the player's cell, position and rotation (degrees).
 - `game_ref`: one reference's base object and type, cell, position, rotation, disabled/deleted/3D state, and every
@@ -56,6 +57,18 @@ operations are `ping`, `console <command>`, `vars <formid hex> <script>`, `playe
   `game_screenshot` along the way. The camera's position and rotation are written every frame (data members only, no
   engine calls by address); the player doesn't move, so outdoors only the cells already loaded are drawn. `tm` in
   the console hides the HUD.
+- `game_crosshair`: what the view ray hits first, cast from the camera along the player's aim (or the free camera's
+  view) through the physics world, as the game's own pick does. Reports the hit point, its distance, the 3D node and
+  the reference that owns it, skipping the player's own collision. When something can't be activated, it shows
+  whose collision is in front of it: building collision is simpler than the visible mesh. It calls `bhkPickData` and
+  `TESObjectCELL::Pick` by address (non-virtual, tested on 1.11.240).
+- `game_move`: moves and/or turns a reference: an absolute position, an offset in the reference's own frame
+  (forward, right, up) and a rotation in degrees. It runs `<ref>.setpos` / `<ref>.setangle`, so it needs no console
+  selection (a `prid` only takes effect a frame later), and reads the result back a few frames later. Like `setpos`,
+  the change is kept in the save.
+- `game_wait_for_load`: returns once a save is loaded, at once if one already is, or with `next=True` after the
+  next load. It waits for the game to start if it isn't running. It reads F4SE's load messages (the save's name from
+  `kPreLoadGame`, then `kPostLoadGame` / `kNewGame`).
 
 Forms print as `FormID EditorID [Plugin.esm] "Display name"`: the editor ID only where the game keeps it at runtime
 (keywords, quests), the defining plugin (none for forms created in game), and the display name if there is one.
