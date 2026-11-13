@@ -10,6 +10,9 @@
 //   ops       ping | console <command> | vars <formid hex> <script> | player | ref <formid hex> | actor <formid hex>
 //             | near <radius> [<base form type> [<x> <y> <z>]] | perf [<seconds>] | place <formid hex> [<distance>]
 //             | screenshot | quest <formid hex or editor ID> | questlog [<count>] | global <formid hex or editor ID>
+//             | camera status|free|release|stop | camera look <point> [<s>] | camera fly <point> <s> [<look point>]
+//             | camera orbit <center> <radius> <height> <s> [<turns> [<aim height> [<start angle>]]]
+//             | camera path <s> <look point or -> <point>...      (a point is x,y,z or a reference's FormID)
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -19,7 +22,9 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <deque>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -545,6 +550,335 @@ namespace Bridge
         return { true, std::format("{} = {}", Name(global), global->GetValue()) };
     }
 
+    // ---------------------------------------------------------------- camera
+    // Smooth moves of the free camera (tfc). Its pose is plain data (FreeCameraState: translation, rotation), so a move
+    // is a write per frame: a pacing thread keeps one main-thread task queued at a time, and each task works out the
+    // pose for the moment it runs. Nothing is called by address. The player doesn't move, so in exteriors the camera
+    // only sees the cells already loaded around the player.
+
+    struct CameraPose
+    {
+        RE::NiPoint3 pos;
+        float        yaw{ 0.0f };    // radians, 0 = north (+y), clockwise, as a reference's angle z
+        float        pitch{ 0.0f };  // radians, positive = looking down, as a reference's angle x
+    };
+
+    using CameraTrack = std::function<CameraPose(float)>;  // seconds since the move started -> pose
+
+    std::atomic_uint64_t cameraGeneration{ 0 };
+    std::mutex           cameraLock;
+    std::string          cameraActivity = "idle";
+
+    constexpr float kPi = 3.14159265358979f;
+    constexpr float kDeg = kPi / 180.0f;
+
+    void SetCameraActivity(std::string a_text)
+    {
+        std::lock_guard lock{ cameraLock };
+        cameraActivity = std::move(a_text);
+    }
+
+    RE::FreeCameraState* FreeCamera()
+    {
+        const auto camera = RE::PlayerCamera::GetSingleton();
+        if (!camera || !camera->currentState || camera->currentState->id.get() != RE::CameraState::kFree) {
+            return nullptr;
+        }
+        return static_cast<RE::FreeCameraState*>(camera->currentState.get());
+    }
+
+    // FreeCameraState::rotation: x = pitch, y = yaw, in radians, the same signs as a reference's angles (checked in game
+    // 2026-11-13: entering free mode, the raw pair matched the player's angle x and z).
+    CameraPose ReadPose(const RE::FreeCameraState* a_state)
+    {
+        return { a_state->translation, a_state->rotation.y, a_state->rotation.x };
+    }
+
+    void WritePose(RE::FreeCameraState* a_state, const CameraPose& a_pose)
+    {
+        a_state->translation = a_pose.pos;
+        a_state->rotation.x = a_pose.pitch;
+        a_state->rotation.y = a_pose.yaw;
+    }
+
+    float Smooth(float a_t)
+    {
+        a_t = std::clamp(a_t, 0.0f, 1.0f);
+        return a_t * a_t * (3.0f - 2.0f * a_t);
+    }
+
+    float AngleLerp(float a_from, float a_to, float a_t)
+    {
+        return a_from + std::remainder(a_to - a_from, 2.0f * kPi) * a_t;
+    }
+
+    RE::NiPoint3 Lerp(const RE::NiPoint3& a_from, const RE::NiPoint3& a_to, float a_t)
+    {
+        return a_from + (a_to - a_from) * a_t;
+    }
+
+    void LookAlong(const RE::NiPoint3& a_direction, CameraPose& a_pose)
+    {
+        const auto flat = std::sqrt(a_direction.x * a_direction.x + a_direction.y * a_direction.y);
+        if (flat < 0.001f && std::abs(a_direction.z) < 0.001f) {
+            return;
+        }
+        a_pose.yaw = std::atan2(a_direction.x, a_direction.y);
+        a_pose.pitch = -std::atan2(a_direction.z, flat);
+    }
+
+    // "x,y,z" or a reference's FormID (hex). Main thread.
+    std::optional<RE::NiPoint3> ParsePoint(const std::string& a_text)
+    {
+        if (a_text.find(',') != std::string::npos) {
+            const auto parts = Split(a_text, ',');
+            if (parts.size() != 3) {
+                return std::nullopt;
+            }
+            return RE::NiPoint3{ std::stof(parts[0]), std::stof(parts[1]), std::stof(parts[2]) };
+        }
+        const auto form = FindForm(a_text);
+        const auto refr = form ? form->As<RE::TESObjectREFR>() : nullptr;
+        if (!refr) {
+            return std::nullopt;
+        }
+        return refr->GetPosition();
+    }
+
+    // Runs a_track for a_seconds. A newer move, "stop" or leaving the free camera ends it.
+    void Animate(CameraTrack a_track, float a_seconds, std::string a_label)
+    {
+        const auto generation = ++cameraGeneration;
+        SetCameraActivity(a_label);
+        auto track = std::make_shared<CameraTrack>(std::move(a_track));
+        std::thread([track, a_seconds, a_label, generation]() {
+            const auto start = std::chrono::steady_clock::now();
+            auto       pending = std::make_shared<std::atomic_bool>(false);
+            auto       done = std::make_shared<std::atomic_bool>(false);
+            const auto tasks = F4SE::GetTaskInterface();
+            while (cameraGeneration == generation && !*done) {
+                if (!pending->exchange(true)) {
+                    tasks->AddTask([track, a_seconds, start, pending, done, generation]() {
+                        if (cameraGeneration == generation) {
+                            const auto elapsed = std::chrono::duration<float>(std::chrono::steady_clock::now() - start).count();
+                            if (const auto state = FreeCamera()) {
+                                WritePose(state, (*track)((std::min)(elapsed, a_seconds)));
+                                if (elapsed >= a_seconds) {
+                                    *done = true;
+                                }
+                            } else {
+                                SetCameraActivity("stopped: the camera left free mode");
+                                ++cameraGeneration;
+                            }
+                        }
+                        *pending = false;
+                    });
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            if (cameraGeneration == generation) {
+                SetCameraActivity("idle (last: " + a_label + ")");
+            }
+        }).detach();
+    }
+
+    std::string PoseText(const CameraPose& a_pose)
+    {
+        return std::format("pos {:.0f} {:.0f} {:.0f}, yaw {:.1f}, pitch {:.1f}", a_pose.pos.x, a_pose.pos.y,
+            a_pose.pos.z, a_pose.yaw / kDeg, a_pose.pitch / kDeg);
+    }
+
+    Reply CameraStatus()
+    {
+        const auto camera = RE::PlayerCamera::GetSingleton();
+        if (!camera || !camera->currentState) {
+            return { false, "no camera" };
+        }
+        std::string activity;
+        {
+            std::lock_guard lock{ cameraLock };
+            activity = cameraActivity;
+        }
+        const auto id = static_cast<int>(camera->currentState->id.get());
+        if (const auto state = FreeCamera()) {
+            return { true, std::format("free camera: {} (raw rotation {:.3f} {:.3f})\nmove: {}", PoseText(ReadPose(state)),
+                               state->rotation.x, state->rotation.y, activity) };
+        }
+        return { true, std::format("camera state {} (not free; \"free\" switches to it)\nmove: {}", id, activity) };
+    }
+
+    // Main thread. a_args after the "camera" op: a subcommand and its arguments.
+    Reply Camera(const std::vector<std::string>& a_args)
+    {
+        const auto sub = a_args.empty() ? std::string{ "status" } : a_args[0];
+        const auto arg = [&](std::size_t i) { return i < a_args.size() ? a_args[i] : std::string{}; };
+        const auto point = [&](std::size_t i) {
+            const auto p = ParsePoint(arg(i));
+            if (!p) {
+                throw std::runtime_error("not a point (x,y,z) or reference: \"" + arg(i) + "\"");
+            }
+            return *p;
+        };
+
+        if (sub == "status") {
+            return CameraStatus();
+        }
+        if (sub == "stop") {
+            ++cameraGeneration;
+            SetCameraActivity("stopped");
+            return CameraStatus();
+        }
+        if (sub == "free") {
+            if (!FreeCamera()) {
+                RunConsole("tfc");
+            }
+            return { true, "free camera on (it takes a frame; check with status)" };
+        }
+        if (sub == "release") {
+            ++cameraGeneration;
+            SetCameraActivity("idle");
+            if (FreeCamera()) {
+                RunConsole("tfc");
+            }
+            return { true, "camera back with the player" };
+        }
+
+        const auto state = FreeCamera();
+        if (!state) {
+            return { false, "the camera isn't free: run \"free\" first" };
+        }
+        const auto from = ReadPose(state);
+
+        if (sub == "look") {  // look <point> [<seconds>]
+            CameraPose to = from;
+            LookAlong(point(1) - from.pos, to);
+            const auto seconds = arg(2).empty() ? 0.0f : std::stof(arg(2));
+            if (seconds <= 0.0f) {
+                WritePose(state, to);
+                return { true, PoseText(to) };
+            }
+            Animate([from, to, seconds](float a_time) {
+                const auto t = Smooth(a_time / seconds);
+                return CameraPose{ from.pos, AngleLerp(from.yaw, to.yaw, t), from.pitch + (to.pitch - from.pitch) * t };
+            },
+                seconds, "look");
+            return { true, "turning to " + PoseText(to) };
+        }
+
+        if (sub == "fly") {  // fly <point> <seconds> [<look point>]
+            const auto target = point(1);
+            const auto seconds = (std::max)(0.1f, std::stof(arg(2)));
+            const auto look = arg(3).empty() ? std::optional<RE::NiPoint3>{} : std::optional{ point(3) };
+            CameraPose to{ target, from.yaw, from.pitch };
+            if (look) {
+                LookAlong(*look - target, to);
+            }
+            Animate([from, to, look, seconds](float a_time) {
+                const auto t = Smooth(a_time / seconds);
+                CameraPose pose{ Lerp(from.pos, to.pos, t), AngleLerp(from.yaw, to.yaw, t),
+                    from.pitch + (to.pitch - from.pitch) * t };
+                if (look && t > 0.0f) {
+                    // Keep the target in view the whole way, blending in from the starting view.
+                    CameraPose aimed = pose;
+                    LookAlong(*look - pose.pos, aimed);
+                    const auto blend = Smooth(a_time / (std::min)(seconds, 1.0f));
+                    pose.yaw = AngleLerp(pose.yaw, aimed.yaw, blend);
+                    pose.pitch = pose.pitch + (aimed.pitch - pose.pitch) * blend;
+                }
+                return pose;
+            },
+                seconds, "fly");
+            return { true, std::format("flying to {:.0f} {:.0f} {:.0f} over {:.1f} s", target.x, target.y, target.z, seconds) };
+        }
+
+        if (sub == "orbit") {  // orbit <center> <radius> <height> <seconds> [<turns>] [<aim height>] [<start angle>]
+            const auto center = point(1);
+            const auto radius = std::stof(arg(2));
+            const auto height = std::stof(arg(3));
+            const auto seconds = (std::max)(0.5f, std::stof(arg(4)));
+            const auto turns = arg(5).empty() ? 1.0f : std::stof(arg(5));
+            const auto aim = arg(6).empty() ? 0.0f : std::stof(arg(6));
+            // Start from the camera's bearing round the centre unless told otherwise, and ease onto the circle over
+            // the first part of the move, so there's no jump.
+            const auto startAngle = arg(7).empty() ? std::atan2(from.pos.x - center.x, from.pos.y - center.y) :
+                                                     std::stof(arg(7)) * kDeg;
+            const auto startRadius = std::sqrt((from.pos.x - center.x) * (from.pos.x - center.x) +
+                                               (from.pos.y - center.y) * (from.pos.y - center.y));
+            const auto startHeight = from.pos.z - center.z;
+            const auto easeIn = (std::min)(2.0f, seconds * 0.2f);
+            const RE::NiPoint3 focus{ center.x, center.y, center.z + aim };
+            Animate([=](float a_time) {
+                const auto blend = Smooth(a_time / easeIn);
+                const auto angle = startAngle + turns * 2.0f * kPi * (a_time / seconds);
+                const auto r = startRadius + (radius - startRadius) * blend;
+                const auto h = startHeight + (height - startHeight) * blend;
+                CameraPose pose{ { center.x + std::sin(angle) * r, center.y + std::cos(angle) * r, center.z + h } };
+                CameraPose aimed = pose;
+                LookAlong(focus - pose.pos, aimed);
+                pose.yaw = AngleLerp(from.yaw, aimed.yaw, blend);
+                pose.pitch = from.pitch + (aimed.pitch - from.pitch) * blend;
+                return pose;
+            },
+                seconds, "orbit");
+            return { true, std::format("orbiting {:.0f} {:.0f} {:.0f}, radius {:.0f}, {:.2f} turns over {:.1f} s",
+                               center.x, center.y, center.z, radius, turns, seconds) };
+        }
+
+        if (sub == "path") {  // path <seconds> <look point or -> <point> <point>...
+            const auto seconds = (std::max)(0.5f, std::stof(arg(1)));
+            const auto look = arg(2) == "-" || arg(2).empty() ? std::optional<RE::NiPoint3>{} : std::optional{ point(2) };
+            std::vector<RE::NiPoint3> points{ from.pos };
+            for (std::size_t i = 3; i < a_args.size(); ++i) {
+                points.push_back(point(i));
+            }
+            if (points.size() < 2) {
+                return { false, "path needs at least one point" };
+            }
+            // Catmull-Rom through the points, timed by distance so the speed is even; eased at both ends.
+            std::vector<float> lengths{ 0.0f };
+            for (std::size_t i = 1; i < points.size(); ++i) {
+                lengths.push_back(lengths.back() + points[i].GetDistance(points[i - 1]));
+            }
+            const auto total = (std::max)(lengths.back(), 1.0f);
+            const auto at = [points, lengths, total](float a_t) {
+                const auto distance = a_t * total;
+                std::size_t i = 1;
+                while (i + 1 < lengths.size() && lengths[i] < distance) {
+                    ++i;
+                }
+                const auto span = (std::max)(lengths[i] - lengths[i - 1], 0.001f);
+                const auto u = std::clamp((distance - lengths[i - 1]) / span, 0.0f, 1.0f);
+                const auto& p1 = points[i - 1];
+                const auto& p2 = points[i];
+                const auto& p0 = i >= 2 ? points[i - 2] : p1;
+                const auto& p3 = i + 1 < points.size() ? points[i + 1] : p2;
+                const auto u2 = u * u;
+                const auto u3 = u2 * u;
+                return (p1 * 2.0f + (p2 - p0) * u + (p0 * 2.0f - p1 * 5.0f + p2 * 4.0f - p3) * u2 +
+                           (p1 * 3.0f - p0 - p2 * 3.0f + p3) * u3) *
+                       0.5f;
+            };
+            Animate([=](float a_time) {
+                const auto t = Smooth(a_time / seconds);
+                CameraPose pose{ at(t), from.yaw, from.pitch };
+                CameraPose aimed = pose;
+                if (look) {
+                    LookAlong(*look - pose.pos, aimed);
+                } else {
+                    LookAlong(at((std::min)(t + 0.02f, 1.0f)) - at((std::max)(t - 0.02f, 0.0f)), aimed);
+                }
+                const auto blend = Smooth(a_time / (std::min)(seconds, 1.0f));
+                pose.yaw = AngleLerp(from.yaw, aimed.yaw, blend);
+                pose.pitch = from.pitch + (aimed.pitch - from.pitch) * blend;
+                return pose;
+            },
+                seconds, "path");
+            return { true, std::format("path through {} points, {:.0f} units over {:.1f} s", points.size() - 1, total, seconds) };
+        }
+
+        return { false, "camera: status | free | release | stop | look | fly | orbit | path" };
+    }
+
     // Frame times over a_seconds of wall time. Runs on the network thread: it queues one main-thread task at a time,
     // each reading the engine's own timer (BSTimer: realTimeDelta is the last frame's length, lastTime its timestamp),
     // and keeps one sample per distinct frame.
@@ -723,6 +1057,17 @@ namespace Bridge
             return OnMainThread([name]() {
                 try {
                     return GlobalValue(name);
+                } catch (const std::exception& e) {
+                    return Reply{ false, e.what() };
+                }
+            });
+        }
+
+        if (op == "camera") {
+            const std::vector<std::string> args(a_parts.begin() + 2, a_parts.end());
+            return OnMainThread([args]() {
+                try {
+                    return Camera(args);
                 } catch (const std::exception& e) {
                     return Reply{ false, e.what() };
                 }

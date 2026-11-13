@@ -175,6 +175,52 @@ def game_global(name: str) -> str:
 
 
 @mcp.tool()
+def game_camera(action: str = "status") -> str:
+    """The free camera (as the console's tfc). action: "status" (camera state; in free mode its position, yaw and
+    pitch in degrees, and the move running), "free" (detach the camera from the player; needed before any move),
+    "stop" (end the move running, the camera stays put), "release" (camera back to the player). The player doesn't
+    move: in exteriors only cells already loaded around the player are drawn. Points in the other camera tools are
+    "x,y,z" or a reference's load-order FormID. Moves return at once and run in game; follow with game_screenshot."""
+    return _call("camera", action)
+
+
+@mcp.tool()
+def game_camera_fly(to: str, seconds: float, look_at: str = "") -> str:
+    """Glide the free camera to a point over seconds, eased at both ends. look_at (a point or reference) keeps that in
+    view along the way; without it the view keeps its direction."""
+    parts = ["camera", "fly", to, str(seconds)]
+    if look_at:
+        parts.append(look_at)
+    return _call(*parts)
+
+
+@mcp.tool()
+def game_camera_look(at: str, seconds: float = 0.0) -> str:
+    """Turn the free camera to face a point or reference, at once or smoothly over seconds."""
+    return _call("camera", "look", at, str(seconds))
+
+
+@mcp.tool()
+def game_camera_orbit(center: str, radius: float, height: float, seconds: float, turns: float = 1.0,
+                      aim_height: float = 0.0, start_angle: float | None = None) -> str:
+    """Circle the free camera round a point or reference, always facing it: radius and height (above the centre) in
+    game units, turns (negative = anticlockwise) over seconds, looking at the centre raised by aim_height (e.g. half
+    a statue's height). It starts from the camera's own bearing (or start_angle, degrees from north) and eases onto
+    the circle, so there's no jump."""
+    parts = ["camera", "orbit", center, str(radius), str(height), str(seconds), str(turns), str(aim_height)]
+    if start_angle is not None:
+        parts.append(str(start_angle))
+    return _call(*parts)
+
+
+@mcp.tool()
+def game_camera_path(points: list[str], seconds: float, look_at: str = "") -> str:
+    """Fly the free camera along a smooth curve from where it is through points (each "x,y,z" or a reference) over
+    seconds, at an even speed, eased at both ends. It faces along the path, or towards look_at if given."""
+    return _call("camera", "path", str(seconds), look_at or "-", *points)
+
+
+@mcp.tool()
 def game_screenshot() -> list:
     """Take a game screenshot (as the screenshot key does) and return it. Needs FO4_GAME_SCREENSHOTS set to the
     folder in the game's sScreenShotBaseName (Fallout4Prefs.ini, [Display]), and bAllowScreenshot=1."""
