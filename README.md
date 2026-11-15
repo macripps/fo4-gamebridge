@@ -12,7 +12,7 @@ It was built to debug Workshop Framework and Sim Settlements 2 scripts while the
 | Part | What it does |
 |---|---|
 | `GameBridge.dll` (`src/`) | F4SE plugin. Listens on `127.0.0.1:47830` on its own thread, so `ping` answers even when Papyrus is jammed. Anything that touches game state runs on the main thread through F4SE's task queue. |
-| `server.py` | MCP server that talks to the plugin. Its tools: `game_status`, `game_console`, `game_script_vars`, `game_player`, `game_ref`, `game_actor`, `game_refs_near`, `game_place`, `game_screenshot`, `game_perf`, `game_quest`, `game_quest_events`, `game_global`, `game_camera`, `game_camera_look`, `game_camera_fly`, `game_camera_orbit`, `game_camera_path`, `game_crosshair`, `game_move`, `game_wait_for_load`, `wsfw_runners`, `papyrus_stacks`, `read_log`, `latest_screenshots`. |
+| `server.py` | MCP server that talks to the plugin. Its tools: `game_status`, `game_console`, `game_script_vars`, `game_player`, `game_ref`, `game_actor`, `game_refs_near`, `game_place`, `game_screenshot`, `game_perf`, `game_quest`, `game_quest_events`, `game_global`, `game_av`, `game_camera`, `game_camera_look`, `game_camera_fly`, `game_camera_orbit`, `game_camera_path`, `game_crosshair`, `game_move`, `game_wait_for_load`, `wsfw_runners`, `papyrus_stacks`, `read_log`, `latest_screenshots`. |
 
 The protocol is one line each way: `id<TAB>op[<TAB>arg...]` in, `{"id":"...","ok":true,"result":"..."}` out. The
 operations are `ping`, `console <command>`, `vars <formid hex> <script>`, `player`, `ref <formid hex>`, `actor <formid hex>`,
@@ -49,6 +49,11 @@ operations are `ping`, `console <command>`, `vars <formid hex> <script>`, `playe
   silently, and Papyrus `OnStageSet` doesn't fire for it either. Give every stage a script reacts to a log entry, even
   an empty one.
 - `game_global`: a global variable's value.
+- `game_av`: actor values on any reference, not only actors. Workbenches keep their resources in actor values (food,
+  water, defense), so `target` `"workshops"` lists every workbench with its location and the values asked for. Sim
+  Settlements 2 keeps its virtual resources and supplies on a separate data store per settlement: list the stores
+  with `game_script_vars` on SettlementManager, variable `SettlementDataStores`, then read them with `game_av`.
+- `game_script_vars` takes an optional `variable` to read just that one, with an array's elements listed.
 - Camera tools, for looking round the world or filming: `game_camera` switches the free camera (as `tfc`) on and off
   and reports where it is; `game_camera_look` turns it to face a point or reference; `game_camera_fly` glides it to a
   point, optionally keeping something in view; `game_camera_orbit` circles a point or reference while facing it

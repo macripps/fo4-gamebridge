@@ -77,9 +77,9 @@ def _log_path(name):
     raise FileNotFoundError(name)
 
 
-def _read_vars(form_id, script):
+def _read_vars(form_id, script, variable=""):
     out = {}
-    for line in _call("vars", form_id, script).splitlines():
+    for line in _call("vars", form_id, script, *([variable] if variable else [])).splitlines():
         key, _, value = line.partition(" = ")
         out[key] = value
     return out
@@ -101,10 +101,11 @@ def game_console(command: str) -> str:
 
 
 @mcp.tool()
-def game_script_vars(form_id: str, script: str) -> dict:
+def game_script_vars(form_id: str, script: str, variable: str = "") -> dict:
     """Read every variable of a script attached to a form, including private ones, e.g. form_id "10001761",
-    script "workshopframework:mainthreadrunner". Values are live."""
-    return _read_vars(form_id, script)
+    script "workshopframework:mainthreadrunner". Values are live; a form shows as [script form=FormID]. With variable
+    (its name, or a property's name for "::Name_var"), only that one, and an array's elements as name[0], name[1]..."""
+    return _read_vars(form_id, script, variable)
 
 
 @mcp.tool()
@@ -172,6 +173,18 @@ def game_global(name: str) -> str:
     """A global variable's current value, by editor ID (e.g. "AIMUS_MoSS_ActionAvailable_CleanRoom_3rdFloorSmallOffice")
     or load-order FormID in hex. Set one with game_console ("set <name> to <value>")."""
     return _call("global", name)
+
+
+@mcp.tool()
+def game_av(target: str, actor_values: list[str]) -> str:
+    """Live actor values on a reference, not only actors: workbenches keep their resources in them (food, water,
+    defense). Sim Settlements 2 keeps its virtual resources and supplies on each settlement's data store instead
+    (SettlementManager's SettlementDataStores array, indexed by workshop ID: list it with game_script_vars).
+    target: a reference's FormID in hex, or "workshops" for every workbench (with its location). actor_values:
+    FormIDs in hex or editor IDs, e.g. ["1104A581"]."""
+    if not actor_values:
+        raise ToolError("give at least one actor value")
+    return _call("av", target, *actor_values)
 
 
 def _loads():

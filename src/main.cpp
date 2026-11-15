@@ -7,9 +7,10 @@
 // Protocol, one line each way:
 //   request   id<TAB>op[<TAB>arg...]
 //   reply     {"id":"...","ok":true,"result":"..."}
-//   ops       ping | console <command> | vars <formid hex> <script> | player | ref <formid hex> | actor <formid hex>
+//   ops       ping | console <command> | vars <formid hex> <script> [<variable>] | player | ref <formid hex> | actor <formid hex>
 //             | near <radius> [<base form type> [<x> <y> <z>]] | perf [<seconds>] | place <formid hex> [<distance>]
 //             | screenshot | quest <formid hex or editor ID> | questlog [<count>] | global <formid hex or editor ID>
+//             | av <reference or "workshops"> <actor value>...
 //             | camera status|free|release|stop | camera look <point> [<s>] | camera fly <point> <s> [<look point>]
 //             | camera orbit <center> <radius> <height> <s> [<turns> [<aim height> [<start angle>]]]
 //             | camera path <s> <look point or -> <point>...      (a point is x,y,z or a reference's FormID)
@@ -163,7 +164,12 @@ namespace Bridge
             if (!object) {
                 return "None";
             }
-            return std::format("[{} handle={:016X}]", object->GetTypeInfo()->GetName(), object->GetHandle());
+            // A form's handle is 0000FFFF in the high half and its FormID in the low half (aliases differ).
+            const auto handle = object->GetHandle();
+            if ((handle >> 32) == 0xFFFF) {
+                return std::format("[{} form={:08X}]", object->GetTypeInfo()->GetName(), static_cast<std::uint32_t>(handle));
+            }
+            return std::format("[{} handle={:016X}]", object->GetTypeInfo()->GetName(), handle);
         }
         if (a_var.is<Variable>()) {
             const auto inner = RE::BSScript::get<Variable>(a_var);
@@ -180,7 +186,8 @@ namespace Bridge
     }
 
     // Every variable of a script on a form, including private ones, read through the VM's own locked accessor.
-    Reply ReadVars(const std::string& a_formID, const std::string& a_script)
+    // With a_only, just that variable (its name, or "X" for a property's "::X_var"), with an array's elements.
+    Reply ReadVars(const std::string& a_formID, const std::string& a_script, const std::string& a_only = {})
     {
         const auto gameVM = RE::GameVM::GetSingleton();
         const auto vm = gameVM ? gameVM->GetVM() : nullptr;
@@ -211,9 +218,22 @@ namespace Bridge
         for (const auto type : chain) {
             const auto variables = type->GetVariableIter();
             for (std::uint32_t i = 0; i < type->GetNumVariables(); ++i, ++index) {
+                const std::string name = variables[i].name.c_str();
+                if (!a_only.empty() && _stricmp(name.c_str(), a_only.c_str()) != 0 &&
+                    _stricmp(name.c_str(), ("::" + a_only + "_var").c_str()) != 0) {
+                    continue;
+                }
                 RE::BSScript::Variable value;
-                if (vm->GetVariableValue(object, index, value)) {
-                    out += std::format("{} = {}\n", variables[i].name.c_str(), Describe(value));
+                if (!vm->GetVariableValue(object, index, value)) {
+                    continue;
+                }
+                out += std::format("{} = {}\n", name, Describe(value));
+                if (!a_only.empty() && value.is<RE::BSScript::Array>()) {
+                    if (const auto array = RE::BSScript::get<RE::BSScript::Array>(value)) {
+                        for (std::uint32_t e = 0; e < array->size(); ++e) {
+                            out += std::format("{}[{}] = {}\n", name, e, Describe((*array)[e]));
+                        }
+                    }
                 }
             }
         }
@@ -564,6 +584,87 @@ namespace Bridge
             return { false, "no global " + a_name };
         }
         return { true, std::format("{} = {}", Name(global), global->GetValue()) };
+    }
+
+    // ---------------------------------------------------------- actor values
+    // Actor values live on any reference, not only actors: workbenches keep their resources in them (food, water,
+    // defense, and Sim Settlements 2's virtual resources and supplies).
+
+    // Every workbench: a container or furniture reference with WorkshopScript bound (vanilla's are containers, base
+    // 000C1AEB "Workshop"). Persistent, so found loaded or not.
+    std::vector<RE::TESObjectREFR*> Workshops()
+    {
+        std::vector<RE::TESObjectREFR*> out;
+        const auto gameVM = RE::GameVM::GetSingleton();
+        const auto vm = gameVM ? gameVM->GetVM() : nullptr;
+        if (!vm) {
+            return out;
+        }
+
+        std::vector<RE::TESObjectREFR*> candidates;
+        {
+            const auto& [map, lock] = RE::TESForm::GetAllForms();
+            RE::BSAutoReadLock l{ lock };
+            if (map) {
+                for (const auto& [id, form] : *map) {
+                    const auto refr = form ? form->As<RE::TESObjectREFR>() : nullptr;
+                    const auto base = refr ? refr->GetObjectReference() : nullptr;
+                    if (base && (base->Is(RE::ENUM_FORM_ID::kCONT) || base->Is(RE::ENUM_FORM_ID::kFURN))) {
+                        candidates.push_back(refr);
+                    }
+                }
+            }
+        }
+
+        auto& policy = vm->GetObjectHandlePolicy();
+        for (const auto refr : candidates) {
+            const auto handle = policy.GetHandleForObject(static_cast<std::uint32_t>(refr->GetFormType()), refr);
+            RE::BSTSmartPointer<RE::BSScript::Object> object;
+            if (vm->FindBoundObject(handle, "WorkshopScript", true, object, false) && object) {
+                out.push_back(refr);
+            }
+        }
+        std::ranges::sort(out, {}, [](const RE::TESObjectREFR* a_refr) { return a_refr->GetFormID(); });
+        return out;
+    }
+
+    // a_target: a reference (FormID or editor ID), or "workshops" for every workbench.
+    Reply ActorValues(const std::string& a_target, const std::vector<std::string>& a_names)
+    {
+        std::vector<RE::ActorValueInfo*> avs;
+        for (const auto& name : a_names) {
+            const auto form = FindForm(name);
+            const auto av = form ? form->As<RE::ActorValueInfo>() : nullptr;
+            if (!av) {
+                return { false, "no actor value " + name };
+            }
+            avs.push_back(av);
+        }
+
+        std::vector<RE::TESObjectREFR*> refs;
+        if (a_target == "workshops") {
+            refs = Workshops();
+        } else {
+            const auto form = FindForm(a_target);
+            const auto refr = form ? form->As<RE::TESObjectREFR>() : nullptr;
+            if (!refr) {
+                return { false, "no reference " + a_target };
+            }
+            refs.push_back(refr);
+        }
+
+        std::string out;
+        for (const auto refr : refs) {
+            auto location = refr->GetCurrentLocation();
+            if (!location) {
+                location = refr->GetEditorLocation();
+            }
+            out += std::format("{} @ {}\n", Name(refr), location ? Name(location) : "no location");
+            for (const auto av : avs) {
+                out += std::format("  {} = {}\n", Name(av), refr->GetActorValue(*av));
+            }
+        }
+        return { true, out.empty() ? "no workbenches found" : out };
     }
 
     // ---------------------------------------------------------------- camera
@@ -1102,9 +1203,10 @@ namespace Bridge
         if (op == "vars" && a_parts.size() >= 4) {
             const auto formID = a_parts[2];
             const auto script = a_parts[3];
-            return OnMainThread([formID, script]() {
+            const auto only = a_parts.size() >= 5 ? a_parts[4] : std::string{};
+            return OnMainThread([formID, script, only]() {
                 try {
-                    return ReadVars(formID, script);
+                    return ReadVars(formID, script, only);
                 } catch (const std::exception& e) {
                     return Reply{ false, e.what() };
                 }
@@ -1197,6 +1299,18 @@ namespace Bridge
             return OnMainThread([name]() {
                 try {
                     return GlobalValue(name);
+                } catch (const std::exception& e) {
+                    return Reply{ false, e.what() };
+                }
+            });
+        }
+
+        if (op == "av" && a_parts.size() >= 4) {
+            const auto target = a_parts[2];
+            const std::vector<std::string> names(a_parts.begin() + 3, a_parts.end());
+            return OnMainThread([target, names]() {
+                try {
+                    return ActorValues(target, names);
                 } catch (const std::exception& e) {
                     return Reply{ false, e.what() };
                 }
