@@ -21,7 +21,18 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 HOST, PORT = "127.0.0.1", 47830
 TIMEOUT = 20
-LOGS = os.path.expanduser(r"~\Documents\My Games\Fallout4\Logs\Script")
+def _documents():
+    """The user's Documents folder, wherever it has been moved to (the game follows a moved Documents too)."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders") as key:
+            return os.path.expandvars(winreg.QueryValueEx(key, "Personal")[0])
+    except OSError:
+        return os.path.expanduser(r"~\Documents")
+
+
+LOGS = os.path.join(_documents(), r"My Games\Fallout4\Logs\Script")
 # Workshop Framework's ThreadRunner01..50 are consecutive forms from 0x001737 in WorkshopFramework.esm. The load-order
 # prefix differs per setup: set WSFW_PREFIX to WorkshopFramework.esm's console prefix (default 10).
 FIRST_RUNNER = int(os.environ.get("WSFW_PREFIX", "10"), 16) << 24 | 0x001737
