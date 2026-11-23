@@ -655,10 +655,9 @@ namespace Bridge
 
         std::string out;
         for (const auto refr : refs) {
-            auto location = refr->GetCurrentLocation();
-            if (!location) {
-                location = refr->GetEditorLocation();
-            }
+            // Current location only: CommonLibF4's zero-argument GetEditorLocation() sits at the wrong vtable slot and
+            // calls the four-argument overload with garbage pointers (crashed the game, 2026-11-23)
+            const auto location = refr->GetCurrentLocation();
             out += std::format("{} @ {}\n", Name(refr), location ? Name(location) : "no location");
             for (const auto av : avs) {
                 out += std::format("  {} = {}\n", Name(av), refr->GetActorValue(*av));
