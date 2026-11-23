@@ -299,11 +299,13 @@ def game_camera_path(points: list[str], seconds: float, look_at: str = "") -> st
 @mcp.tool()
 def game_screenshot() -> list:
     """Take a game screenshot (as the screenshot key does) and return it. Needs FO4_GAME_SCREENSHOTS set to the
-    folder in the game's sScreenShotBaseName (Fallout4Prefs.ini, [Display]), and bAllowScreenshot=1."""
-    folder = os.environ.get("FO4_GAME_SCREENSHOTS", "")
-    if not folder or not os.path.isdir(folder):
+    folder in the game's sScreenShotBaseName (Fallout4Prefs.ini, [Display]), and bAllowScreenshot=1. Several
+    folders (one per MO2 profile) can be given, separated by ";"."""
+    folders = [f for f in os.environ.get("FO4_GAME_SCREENSHOTS", "").split(";") if f and os.path.isdir(f)]
+    if not folders:
         raise ToolError("set FO4_GAME_SCREENSHOTS to the folder in the game's sScreenShotBaseName")
-    pattern = [os.path.join(folder, "*.png"), os.path.join(folder, "*.jpg"), os.path.join(folder, "*.bmp")]
+    folder = "; ".join(folders)
+    pattern = [os.path.join(f, ext) for f in folders for ext in ("*.png", "*.jpg", "*.bmp")]
     before = {p: os.path.getmtime(p) for g in pattern for p in glob.glob(g)}
     _call("screenshot")
     deadline = time.time() + 10
