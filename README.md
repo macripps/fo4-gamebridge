@@ -12,7 +12,7 @@ It was built to debug Workshop Framework and Sim Settlements 2 scripts while the
 | Part | What it does |
 |---|---|
 | `GameBridge.dll` (`src/`) | F4SE plugin. Listens on `127.0.0.1:47830` on its own thread, so `ping` answers even when Papyrus is jammed. Anything that touches game state runs on the main thread through F4SE's task queue. |
-| `server.py` | MCP server that talks to the plugin. Its tools: `game_status`, `game_console`, `game_script_vars`, `game_player`, `game_ref`, `game_actor`, `game_refs_near`, `game_place`, `game_screenshot`, `game_perf`, `game_quest`, `game_quest_events`, `game_global`, `game_av`, `game_camera`, `game_camera_look`, `game_camera_fly`, `game_camera_orbit`, `game_camera_path`, `game_crosshair`, `game_move`, `game_wait_for_load`, `wsfw_runners`, `papyrus_stacks`, `read_log`, `latest_screenshots`. |
+| `server.py` | MCP server that talks to the plugin. Its tools: `game_status`, `game_console`, `game_script_vars`, `game_player`, `game_ref`, `game_actor`, `game_refs_near`, `game_scripted_refs`, `game_plots`, `game_place`, `game_screenshot`, `game_perf`, `game_quest`, `game_quest_events`, `game_global`, `game_av`, `game_camera`, `game_camera_look`, `game_camera_fly`, `game_camera_orbit`, `game_camera_path`, `game_crosshair`, `game_move`, `game_wait_for_load`, `wsfw_runners`, `papyrus_stacks`, `read_log`, `latest_screenshots`. |
 
 The protocol is one line each way: `id<TAB>op[<TAB>arg...]` in, `{"id":"...","ok":true,"result":"..."}` out. The
 operations are `ping`, `console <command>`, `vars <formid hex> <script>`, `player`, `ref <formid hex>`, `actor <formid hex>`,
@@ -36,8 +36,15 @@ operations are `ping`, `console <command>`, `vars <formid hex> <script>`, `playe
   `FO4_GAME_SCREENSHOTS` to the folder in the game's `sScreenShotBaseName` (`[Display]` in `Fallout4Prefs.ini` or
   your custom ini), with `bAllowScreenshot=1`.
 - `game_refs_near`: references within a radius of the player or a point (in the interior cell, or across all loaded
-  exterior cells), nearest first (up to 300), optionally only
+  exterior cells), nearest first (up to 2000), optionally only
   those whose base is a given form type (`LIGH`, `STAT`, `CONT`...). Finds objects scripts spawned (`FF...` FormIDs).
+  Each row has the position, rotation, scale and the base's bounds (`OBND`), and flags `DISABLED` and `DELETED`
+  (marked for delete); `enabled_only` skips both. `save_to` writes the rows to a file and returns a summary, for
+  sweeping a whole settlement.
+- `game_scripted_refs`: every reference in range that carries a given Papyrus script, each with the script variables
+  you name; form values print as the form's name. One call instead of one `game_script_vars` per reference.
+  `game_plots` is the Sim Settlements 2 form: each plot's building plan, current level plan, level, occupants, and
+  whether it's active or under construction.
 - `game_perf`: frame rate and frame times (mean, median, 99th percentile, worst) over 0.5 to 10 seconds, read from the
   engine's own frame timer. Compare runs from the same spot and facing, e.g. a room before and after a change. With
   vsync on, a cost shows first in the 99th percentile and worst frames.

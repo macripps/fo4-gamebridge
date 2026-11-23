@@ -365,8 +365,9 @@ namespace Bridge
 
     // References within a_radius of a point (default: the player), in the player's interior cell or the loaded exterior
     // cells, nearest first. a_type filters by
-    // the base's form type ("LIGH", "STAT", "CONT", ...); empty means all.
-    Reply Near(float a_radius, const std::string& a_type, std::optional<RE::NiPoint3> a_origin)
+    // the base's form type ("LIGH", "STAT", "CONT", ...); empty means all. a_enabledOnly skips disabled and deleted
+    // references. Each row ends with the reference's scale and the base's bounds (OBND, unscaled, object space).
+    Reply Near(float a_radius, const std::string& a_type, std::optional<RE::NiPoint3> a_origin, bool a_enabledOnly)
     {
         const auto player = RE::PlayerCharacter::GetSingleton();
         const auto cell = player ? player->GetParentCell() : nullptr;
@@ -384,17 +385,94 @@ namespace Bridge
         std::vector<std::pair<float, std::string>> rows;
         tes->ForEachReferenceInRange(origin, a_radius, [&](RE::TESObjectREFR* a_ref) {
             const auto base = a_ref ? a_ref->GetObjectReference() : nullptr;
-            if (base && a_ref != player && (a_type.empty() || a_type == base->GetFormTypeString())) {
+            if (base && a_ref != player && (a_type.empty() || a_type == base->GetFormTypeString()) &&
+                !(a_enabledOnly && (a_ref->IsDisabled() || a_ref->GetDelete()))) {
                 const auto distance = origin.GetDistance(a_ref->GetPosition());
-                rows.emplace_back(distance, std::format("{:08X} base {} ({}) dist {:.0f} {}{}", a_ref->GetFormID(), Name(base),
-                    base->GetFormTypeString(), distance, Where(a_ref), a_ref->IsDisabled() ? " DISABLED" : ""));
+                const auto& b = base->boundData;
+                rows.emplace_back(distance, std::format("{:08X} base {} ({}) dist {:.0f} {} scale {:.2f} bounds {} {} {} {} {} {}{}{}",
+                    a_ref->GetFormID(), Name(base), base->GetFormTypeString(), distance, Where(a_ref),
+                    a_ref->refScale / 100.0f, b.boundMin.x, b.boundMin.y, b.boundMin.z, b.boundMax.x, b.boundMax.y,
+                    b.boundMax.z, a_ref->IsDisabled() ? " DISABLED" : "", a_ref->GetDelete() ? " DELETED" : ""));
             }
             return RE::BSContainer::ForEachResult::kContinue;
         });
 
         std::ranges::sort(rows, {}, &std::pair<float, std::string>::first);
         std::string out = std::format("{} references\n", rows.size());
-        for (std::size_t i = 0; i < rows.size() && i < 300; ++i) {
+        for (std::size_t i = 0; i < rows.size() && i < 2000; ++i) {
+            out += rows[i].second + "\n";
+        }
+        return { true, out };
+    }
+
+    // Every reference within a_radius of a point carrying script a_script, nearest first, with the variables named in
+    // a_vars (comma-separated; "X" also matches a property's "::X_var"). A form value is followed by the form's name,
+    // so a plan or a quest reads as itself. One call instead of one per reference and variable.
+    Reply ScriptedNear(float a_radius, std::optional<RE::NiPoint3> a_origin, const std::string& a_script,
+        const std::string& a_vars, bool a_enabledOnly)
+    {
+        const auto player = RE::PlayerCharacter::GetSingleton();
+        const auto tes = RE::TES::GetSingleton();
+        const auto gameVM = RE::GameVM::GetSingleton();
+        const auto vm = gameVM ? gameVM->GetVM() : nullptr;
+        if (!player || !tes || !vm || a_radius <= 0.0f) {
+            return { false, "no player, TES or VM, or radius not above 0" };
+        }
+        const auto origin = a_origin.value_or(player->GetPosition());
+        const auto wanted = Split(a_vars, ',');
+        auto&      policy = vm->GetObjectHandlePolicy();
+
+        std::vector<std::pair<float, std::string>> rows;
+        tes->ForEachReferenceInRange(origin, a_radius, [&](RE::TESObjectREFR* a_ref) {
+            if (!a_ref || (a_enabledOnly && (a_ref->IsDisabled() || a_ref->GetDelete()))) {
+                return RE::BSContainer::ForEachResult::kContinue;
+            }
+            const auto handle = policy.GetHandleForObject(static_cast<std::uint32_t>(a_ref->GetFormType()), a_ref);
+            RE::BSTSmartPointer<RE::BSScript::Object> object;
+            if (!vm->FindBoundObject(handle, a_script.c_str(), true, object, false) || !object) {
+                return RE::BSContainer::ForEachResult::kContinue;
+            }
+            const auto distance = origin.GetDistance(a_ref->GetPosition());
+            std::string row = std::format("{:08X} base {} dist {:.0f} {}{}{}", a_ref->GetFormID(),
+                Name(a_ref->GetObjectReference()), distance, Where(a_ref), a_ref->IsDisabled() ? " DISABLED" : "",
+                a_ref->GetDelete() ? " DELETED" : "");
+
+            std::vector<RE::BSScript::ObjectTypeInfo*> chain;
+            for (auto type = object->GetTypeInfo(); type; type = type->parentTypeInfo.get()) {
+                chain.insert(chain.begin(), type);
+            }
+            for (const auto& want : wanted) {
+                std::uint32_t index = 0;
+                for (const auto type : chain) {
+                    const auto variables = type->GetVariableIter();
+                    for (std::uint32_t i = 0; i < type->GetNumVariables(); ++i, ++index) {
+                        const char* name = variables[i].name.c_str();
+                        if (_stricmp(name, want.c_str()) != 0 && _stricmp(name, ("::" + want + "_var").c_str()) != 0) {
+                            continue;
+                        }
+                        RE::BSScript::Variable value;
+                        if (!vm->GetVariableValue(object, index, value)) {
+                            continue;
+                        }
+                        std::string text = Describe(value);
+                        if (value.is<RE::BSScript::Object>()) {
+                            const auto& obj = RE::BSScript::get<RE::BSScript::Object>(value);
+                            const auto h = obj ? obj->GetHandle() : 0;
+                            if (obj && (h >> 32) == 0xFFFF) {
+                                text = Name(RE::TESForm::GetFormByID(static_cast<RE::TESFormID>(h)));
+                            }
+                        }
+                        row += std::format("\n    {} = {}", want, text);
+                    }
+                }
+            }
+            rows.emplace_back(distance, row);
+            return RE::BSContainer::ForEachResult::kContinue;
+        });
+
+        std::ranges::sort(rows, {}, &std::pair<float, std::string>::first);
+        std::string out = std::format("{} references with {}\n", rows.size(), a_script);
+        for (std::size_t i = 0; i < rows.size() && i < 500; ++i) {
             out += rows[i].second + "\n";
         }
         return { true, out };
@@ -1238,15 +1316,35 @@ namespace Bridge
             });
         }
 
+        // scripted <radius> <script> <var,var,...> [x y z] [enabled_only 0/1]
+        if (op == "scripted" && a_parts.size() >= 5) {
+            try {
+                const auto radius = std::stof(a_parts[2]);
+                const auto script = a_parts[3];
+                const auto vars = a_parts[4];
+                std::optional<RE::NiPoint3> origin;
+                if (a_parts.size() >= 8 && !a_parts[5].empty()) {
+                    origin = RE::NiPoint3{ std::stof(a_parts[5]), std::stof(a_parts[6]), std::stof(a_parts[7]) };
+                }
+                const bool enabledOnly = a_parts.size() >= 9 && a_parts[8] == "1";
+                return OnMainThread([radius, origin, script, vars, enabledOnly]() {
+                    return ScriptedNear(radius, origin, script, vars, enabledOnly);
+                });
+            } catch (const std::exception& e) {
+                return Reply{ false, e.what() };
+            }
+        }
+
         if (op == "near" && a_parts.size() >= 3) {
             try {
                 const auto radius = std::stof(a_parts[2]);
                 const auto type = a_parts.size() >= 4 ? a_parts[3] : std::string{};
                 std::optional<RE::NiPoint3> origin;
-                if (a_parts.size() >= 7) {
+                if (a_parts.size() >= 7 && !a_parts[4].empty()) {
                     origin = RE::NiPoint3{ std::stof(a_parts[4]), std::stof(a_parts[5]), std::stof(a_parts[6]) };
                 }
-                return OnMainThread([radius, type, origin]() { return Near(radius, type, origin); });
+                const bool enabledOnly = a_parts.size() >= 8 && a_parts[7] == "1";
+                return OnMainThread([radius, type, origin, enabledOnly]() { return Near(radius, type, origin, enabledOnly); });
             } catch (const std::exception& e) {
                 return Reply{ false, e.what() };
             }

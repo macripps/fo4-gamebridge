@@ -144,14 +144,60 @@ def game_actor(form_id: str) -> str:
 
 @mcp.tool()
 def game_refs_near(radius: float, form_type: str = "", x: float | None = None, y: float | None = None,
-                   z: float | None = None) -> str:
-    """References within radius of a point in the player's cell, nearest first (up to 300). The point defaults to
-    the player. form_type filters by the base's type, e.g. "LIGH", "STAT", "CONT", "ACTI", "FURN". Finds objects a
-    script spawned (FF... FormIDs); follow up with game_ref."""
+                   z: float | None = None, enabled_only: bool = False, save_to: str = "") -> str:
+    """References within radius of a point in the player's cell, nearest first (up to 2000). The point defaults to
+    the player. form_type filters by the base's type, e.g. "LIGH", "STAT", "CONT", "ACTI", "FURN". enabled_only skips
+    disabled and deleted references (old plot stages leave many disabled ones). Each row gives position, rotation
+    (degrees), scale and the base's bounds (OBND: min x y z, max x y z, object space, unscaled), so footprints can be
+    drawn. Finds objects a script spawned (FF... FormIDs); follow up with game_ref. save_to: a file path; the rows go
+    there (appended) and only a summary comes back, for big sweeps."""
     parts = ["near", str(radius), form_type]
     if x is not None and y is not None and z is not None:
         parts += [str(x), str(y), str(z)]
-    return _call(*parts)
+    else:
+        parts += ["", "", ""]
+    parts.append("1" if enabled_only else "0")
+    text = _call(*parts)
+    if not save_to:
+        return text
+    lines = text.splitlines()
+    with open(save_to, "a", encoding="utf-8") as f:
+        f.write("\n".join(lines[1:]) + "\n")
+    rows = lines[1:]
+    return (f"{lines[0] if lines else '0 references'}; wrote {len(rows)} rows to {save_to} "
+            f"({sum(1 for r in rows if 'DISABLED' in r)} disabled, {sum(1 for r in rows if 'DELETED' in r)} deleted)")
+
+
+@mcp.tool()
+def game_scripted_refs(script: str, variables: str, radius: float = 6000.0, x: float | None = None,
+                       y: float | None = None, z: float | None = None, enabled_only: bool = True,
+                       save_to: str = "") -> str:
+    """Every reference within radius of a point (default: the player) carrying a Papyrus script, nearest first (up to
+    500), each with the script variables named in variables (comma-separated; "X" also matches a property's
+    "::X_var"). Form values print as the form's name ("0A2B3C4D EditorID [Plugin] "Name""). One call replaces a
+    game_refs_near plus a game_script_vars per reference. save_to: write the rows to a file, return a summary."""
+    parts = ["scripted", str(radius), script, variables]
+    parts += [str(x), str(y), str(z)] if x is not None and y is not None and z is not None else ["", "", ""]
+    parts.append("1" if enabled_only else "0")
+    text = _call(*parts)
+    if not save_to:
+        return text
+    with open(save_to, "w", encoding="utf-8") as f:
+        f.write(text)
+    return text.splitlines()[0] + f"; wrote to {save_to}"
+
+
+SS2_PLOT_SCRIPT = "SimSettlementsV2:ObjectReferences:SimPlot"
+SS2_PLOT_VARS = "ParentBuildingPlan,CurrentLevelPlan,iCurrentLevel,iOccupants,bIsPlotActive,bUnderConstruction"
+
+
+@mcp.tool()
+def game_plots(radius: float = 6000.0, x: float | None = None, y: float | None = None, z: float | None = None,
+               save_to: str = "") -> str:
+    """Sim Settlements 2 plots round a point (default: the player), enabled ones only: for each, its plot type and
+    position, building plan, current level plan (None = nothing built yet), level, assigned occupants, and whether it's
+    active or under construction. game_scripted_refs with SS2's SimPlot script; works only with SS2 loaded."""
+    return game_scripted_refs(SS2_PLOT_SCRIPT, SS2_PLOT_VARS, radius, x, y, z, True, save_to)
 
 
 @mcp.tool()
