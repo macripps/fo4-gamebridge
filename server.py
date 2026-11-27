@@ -134,6 +134,72 @@ def game_ref(form_id: str) -> str:
 
 
 @mcp.tool()
+def game_ref_holds(form_id: str) -> str:
+    """What keeps a reference alive (a deleted reference is only freed once nothing persists it): form flags (deleted,
+    persistent, disabled) and engine refcount; the Papyrus persist count on its handle (a script variable, array,
+    event registration or alias holding it); each script bound to it with the script object's raw refcount word (the
+    VM's own table holds one); the quest aliases holding it; every reference linking to it (keyword <- ref); and the
+    type of each extra data on it. form_id: load-order FormID in hex, e.g. "FF01E7FE"."""
+    return _call("holds", form_id)
+
+
+@mcp.tool()
+def game_ref_holds_near(radius: float, deleted_only: bool = True, form_type: str = "", save_to: str = "") -> str:
+    """game_ref_holds for every reference within radius of the player (default: deleted ones only), one tab-separated
+    line each: FormID, base, form flags, engine refs, persist count, scripts (name:refcount word), aliases, linked-from
+    (count:FormIDs), extra data types. For finding what blocks a settlement's deleted leftovers. save_to: write the
+    rows to a file and return a summary of persist counts, scripts, aliases and links."""
+    text = _call("holdsnear", str(radius), "1" if deleted_only else "0", form_type)
+    if not save_to:
+        return text
+    with open(save_to, "w", encoding="utf-8") as f:
+        f.write(text)
+    rows = [r.split("\t") for r in text.splitlines()[1:]]
+    def count(i, empty):
+        return sum(1 for r in rows if len(r) > i and r[i].split(" ", 1)[1] != empty)
+    return (f"{len(rows)} references; wrote to {save_to}. With a persist count: {count(4, '-')}, with scripts: "
+            f"{count(5, '-')}, in an alias: {count(6, '-')}, linked from another ref: {count(7, '-')}")
+
+
+@mcp.tool()
+def game_ref_demote(form_id: str, owner: str = "") -> str:
+    """Dev-only fix prototype: removes one promoter from a reference with the engine's
+    BGSDynamicPersistenceManager::DemoteReference, the reference itself unless owner (a FormID in hex) is given.
+    Reports the holds before and after. For SS2 leftovers that are deleted and promoted only by themselves. Changes
+    the running game: use on a test profile, and don't save unless that's the point."""
+    return _call("demote", form_id, *([owner] if owner else []))
+
+
+@mcp.tool()
+def game_ref_demote_near(radius: float) -> str:
+    """Dev-only fix prototype: game_ref_demote (owner = itself) on every deleted reference within radius of the player
+    that lists itself as a promoter. Returns one line per reference with its state afterwards."""
+    return _call("demotenear", str(radius))
+
+
+@mcp.tool()
+def game_ref_demote_all() -> str:
+    """Dev-only fix prototype: game_ref_demote (owner = itself) on every deleted, self-promoted reference in memory,
+    the whole save (persistent references are always loaded), not just nearby cells. Reports how many were released
+    and the bases released most. Changes the running game: test profile; save under a new name to measure."""
+    return _call("demoteall")
+
+
+@mcp.tool()
+def game_promote_hook(action: str = "read", count: int = 200, all_calls: bool = False) -> str:
+    """Dev-only: a detour on the engine's PromoteReference that records who promotes references to persistent.
+    action "on" installs it (once per game run; it checks the function's first bytes and refuses if they differ) and
+    starts recording self-promotions (a reference promoted by itself), or every promotion with all_calls; "off" stops
+    recording; "clear" empties the buffer (last 3000 kept); "read" returns the last count records: time, thread, ref,
+    base, owner, then a native backtrace as module+offset (map with tools/promotetrace.py)."""
+    if action == "on":
+        return _call("promotehook", "on", *(["all"] if all_calls else []))
+    if action == "read":
+        return _call("promotehook", "read", str(count))
+    return _call("promotehook", action)
+
+
+@mcp.tool()
 def game_actor(form_id: str) -> str:
     """One actor, live: life state, disabled, talking to the player, the AI package it is running (with the
     package's target), the furniture it is using or heading to (sitting = using a chair or sit marker), and the items
@@ -187,7 +253,47 @@ def game_scripted_refs(script: str, variables: str, radius: float = 6000.0, x: f
     return text.splitlines()[0] + f"; wrote to {save_to}"
 
 
-SS2_PLOT_SCRIPT = "SimSettlementsV2:ObjectReferences:SimPlot"
+def _batch_lines(path):
+    with open(path, encoding="utf-8") as f:
+        return sum(1 for line in f if line.strip() and not line.startswith("#"))
+
+
+def _batch(op, list_path, record_path, chunk=100):
+    total, out = _batch_lines(list_path), []
+    for start in range(0, total, chunk):
+        out.append(_call(op, list_path, record_path, str(start), str(chunk)).strip())
+    return f"{total} lines\n" + "\n".join(out)
+
+
+@mcp.tool()
+def game_place_batch(list_path: str, record_path: str) -> str:
+    """Place many objects at once, for mock-ups. list_path: one line per object, "FORMID x y z rx ry rz scale"
+    (load-order FormID in hex, angles in degrees; blank lines and # comments skipped). Placed in the player's
+    worldspace (or interior) as plain references, 100 per game frame. Each new reference is appended to record_path
+    as "placed <ref>", so game_undo_batch removes exactly those. Place statics, not scripted objects (no workshop link)."""
+    return _batch("placebatch", list_path, record_path)
+
+
+@mcp.tool()
+def game_disable_batch(list_path: str, record_path: str) -> str:
+    """Disable existing references listed one per line (load-order FormID first), appending "disabled <ref>" to
+    record_path so game_undo_batch enables them again. For a mock-up's scrap list. Precombined references stay drawn
+    while their precombine is intact."""
+    return _batch("disablebatch", list_path, record_path)
+
+
+@mcp.tool()
+def game_undo_batch(record_path: str) -> str:
+    """Undo a record from game_place_batch / game_disable_batch: placed references are disabled and marked for delete,
+    disabled ones enabled again."""
+    total, out = _batch_lines(record_path), []
+    for pass_ in ("0", "1"):  # disable/enable, then delete: one game frame each
+        for start in range(0, total, 200):
+            out.append(_call("undobatch", record_path, str(start), "200", pass_).strip())
+    return f"{total} records\n" + "\n".join(out)
+
+
+SS2_PLOT_SCRIPT ="SimSettlementsV2:ObjectReferences:SimPlot"
 SS2_PLOT_VARS = "ParentBuildingPlan,CurrentLevelPlan,iCurrentLevel,iOccupants,bIsPlotActive,bUnderConstruction"
 
 

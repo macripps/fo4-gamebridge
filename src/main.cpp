@@ -14,6 +14,11 @@
 //             | camera status|free|release|stop | camera look <point> [<s>] | camera fly <point> <s> [<look point>]
 //             | camera orbit <center> <radius> <height> <s> [<turns> [<aim height> [<start angle>]]]
 //             | camera path <s> <look point or -> <point>...      (a point is x,y,z or a reference's FormID)
+//             | holds <formid hex> | holdsnear <radius> [<deleted only 0|1> [<base form type>]]
+//             | demote <formid hex> [<owner formid hex>] | demotenear <radius> | demoteall  (dev-only fix prototype)
+//             | promotehook on [all] | off | clear | read [<count>]                 (dev-only detour)
+
+#include "extratypes.h"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -25,6 +30,7 @@
 #include <chrono>
 #include <cmath>
 #include <deque>
+#include <fstream>
 #include <functional>
 #include <future>
 #include <memory>
@@ -304,6 +310,487 @@ namespace Bridge
         return { true, out };
     }
 
+    // ---------------------------------------------------------------- holds
+    // What keeps a reference alive. A deleted reference is only freed once nothing persists it, and the save's
+    // change forms don't say what does (2026-11-26: 90k deleted, persistent plot accessories in one save, most with
+    // no visible holder). Read here, data members only, under the engine's own locks:
+    //   - form flags (0x20 deleted, 0x400 persistent, 0x800 disabled) and the engine refcount (BSHandleRefObject)
+    //   - the Papyrus handle policy's persist count for the reference's handle, and a queued promote
+    //   - the scripts bound to it, each script object's raw refCountAndHandleLock (the VM's attached-script table
+    //     holds one; more means a variable, array or stack elsewhere holds the object)
+    //   - the quest aliases holding it (ExtraAliasInstanceArray), the references linking to it (ExtraLinkedRefChildren)
+    //   - the type of every extra data on it
+    // Copies a_size bytes, or returns false if the memory can't be read. For layouts CommonLibF4 doesn't define.
+    bool SafeRead(const void* a_src, void* a_dst, std::size_t a_size)
+    {
+        __try {
+            std::memcpy(a_dst, a_src, a_size);
+            return true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+    }
+
+    // ExtraPromotedRef: who promoted the reference to persistent. Not in CommonLibF4; as in Skyrim, a
+    // BSTArray<TESForm*> right after the extra header (here 0x18: data pointer, capacity, size). Read guarded, and an
+    // element counts only if GetFormByID of the FormID it holds gives back the same pointer.
+    std::vector<std::string> ReadPromoters(const RE::BSExtraData* a_extra)
+    {
+        struct
+        {
+            std::uintptr_t data;
+            std::uint32_t  capacity;
+            std::uint32_t  pad;
+            std::uint32_t  size;
+        } array{};
+        std::vector<std::string> out;
+        if (!SafeRead(reinterpret_cast<const std::byte*>(a_extra) + 0x18, &array, sizeof(array))) {
+            return { "(unreadable)" };
+        }
+        if (array.size > 4096 || array.size > array.capacity || (array.size && !array.data)) {
+            return { std::format("(unexpected layout: data {:X} capacity {} size {})", array.data, array.capacity, array.size) };
+        }
+        for (std::uint32_t i = 0; i < array.size; ++i) {
+            std::uintptr_t element = 0;
+            std::uint32_t  formID = 0;
+            if (!SafeRead(reinterpret_cast<const void*>(array.data + i * 8), &element, 8) || !element ||
+                !SafeRead(reinterpret_cast<const void*>(element + 0x14), &formID, 4)) {
+                out.emplace_back(std::format("(unreadable element {:X})", element));
+                continue;
+            }
+            const auto form = RE::TESForm::GetFormByID(formID);
+            out.emplace_back(reinterpret_cast<std::uintptr_t>(form) == element ?
+                                 Name(form) + std::format(" ({})", form->GetFormTypeString()) :
+                                 std::format("(not a form: {:X}, FormID field {:08X})", element, formID));
+        }
+        return out;
+    }
+
+    struct Holds
+    {
+        std::vector<std::string>                          promoters;
+        std::uint32_t                                     formFlags{ 0 };
+        std::uint32_t                                     engineRefs{ 0 };
+        std::uint64_t                                     handle{ 0 };
+        std::optional<std::uint32_t>                      persistCount;
+        bool                                              queuedPromote{ false };
+        std::vector<std::pair<std::string, std::uint32_t>> scripts;
+        std::vector<std::string>                          aliases;
+        std::vector<std::string>                          children;
+        std::vector<std::string>                          extras;
+    };
+
+    Holds ReadHolds(RE::TESObjectREFR* a_ref, bool a_childNames)
+    {
+        Holds h;
+        h.formFlags = a_ref->formFlags;
+        h.engineRefs = static_cast<const RE::BSHandleRefObject*>(a_ref)->QRefCount();
+
+        const auto gameVM = RE::GameVM::GetSingleton();
+        const auto vm = gameVM ? gameVM->GetVM() : nullptr;
+        if (vm) {
+            auto& policy = static_cast<RE::GameScript::HandlePolicy&>(vm->GetObjectHandlePolicy());
+            h.handle = policy.GetHandleForObject(static_cast<std::uint32_t>(a_ref->GetFormType()), a_ref);
+            {
+                RE::BSAutoLock lock{ policy.persistLock };
+                if (const auto it = policy.persistRefCount.find(h.handle); it != policy.persistRefCount.end()) {
+                    h.persistCount = it->second;
+                }
+                h.queuedPromote = policy.queuedPromotes.contains(h.handle);
+            }
+            const auto impl = static_cast<RE::BSScript::Internal::VirtualMachine*>(vm.get());
+            RE::BSAutoLock lock{ impl->attachedScriptsLock };
+            if (const auto it = impl->attachedScripts.find(h.handle); it != impl->attachedScripts.end()) {
+                for (const auto& attached : it->second) {
+                    if (const auto object = attached.get()) {
+                        const auto type = object->GetTypeInfo();
+                        h.scripts.emplace_back(type ? type->GetName() : "?", object->refCountAndHandleLock);
+                    }
+                }
+            }
+        }
+
+        if (const auto& list = a_ref->extraList) {
+            for (std::uint32_t t = 1; t < std::size(kExtraTypeNames); ++t) {
+                if (list->GetByType(static_cast<RE::EXTRA_DATA_TYPE>(t))) {
+                    h.extras.emplace_back(kExtraTypeNames[t]);
+                }
+            }
+            if (const auto promoted = list->GetByType(RE::EXTRA_DATA_TYPE::kPromotedRef)) {
+                h.promoters = ReadPromoters(promoted);
+            }
+            if (const auto aliases = list->GetByType<RE::ExtraAliasInstanceArray>()) {
+                RE::BSAutoLock<RE::BSReadWriteLock, RE::BSAutoLockReadLockPolicy> lock{ aliases->aliasArrayLock };
+                for (const auto& entry : aliases->aliasArray) {
+                    h.aliases.emplace_back(std::format("{} / {}", Name(entry.quest),
+                        entry.alias ? entry.alias->aliasName.c_str() : "?"));
+                }
+            }
+            if (const auto children = list->GetByType<RE::ExtraLinkedRefChildren>()) {
+                for (const auto& child : children->linkedChildren) {
+                    const auto ref = child.REFR.get();
+                    if (a_childNames) {
+                        h.children.emplace_back(std::format("{} <- {}{}", Name(child.keyword), Name(ref.get()),
+                            ref ? std::format(" (base {}){}{}", Name(ref->GetObjectReference()),
+                                      ref->IsDisabled() ? " DISABLED" : "", ref->GetDelete() ? " DELETED" : "") :
+                                  std::string{}));
+                    } else {
+                        h.children.emplace_back(ref ? std::format("{:08X}", ref->GetFormID()) : "None");
+                    }
+                }
+            }
+        }
+        return h;
+    }
+
+    Reply HoldsInfo(const std::string& a_formID)
+    {
+        const auto form = RE::TESForm::GetFormByID(static_cast<RE::TESFormID>(std::stoul(a_formID, nullptr, 16)));
+        const auto refr = form ? form->As<RE::TESObjectREFR>() : nullptr;
+        if (!refr) {
+            return { false, "no reference " + a_formID };
+        }
+        const auto h = ReadHolds(refr, true);
+        std::string out = std::format("ref {}\nbase {}\ncell {}\n", Name(refr), Name(refr->GetObjectReference()),
+            Name(refr->GetParentCell()));
+        out += std::format("form flags {:08X}: deleted {}, persistent {}, disabled {}; engine refcount {}\n", h.formFlags,
+            (h.formFlags & 0x20) != 0, (h.formFlags & 0x400) != 0, (h.formFlags & 0x800) != 0, h.engineRefs);
+        out += std::format("papyrus handle {:016X}: persist count {}, promote queued {}\n", h.handle,
+            h.persistCount ? std::to_string(*h.persistCount) : "none", h.queuedPromote);
+        out += h.scripts.empty() ? "scripts: none bound\n" : "scripts (raw refCountAndHandleLock):\n";
+        for (const auto& [name, refs] : h.scripts) {
+            out += std::format("  {} {:08X}\n", name, refs);
+        }
+        out += h.promoters.empty() ? "promoted by: no ExtraPromotedRef\n" : std::format("promoted by ({}):\n", h.promoters.size());
+        for (const auto& p : h.promoters) {
+            out += "  " + p + "\n";
+        }
+        out += h.aliases.empty() ? "aliases: none\n" : "aliases:\n";
+        for (const auto& a : h.aliases) {
+            out += "  " + a + "\n";
+        }
+        out += std::format("linked from ({}):{}", h.children.size(), h.children.empty() ? " none\n" : "\n");
+        for (const auto& c : h.children) {
+            out += "  " + c + "\n";
+        }
+        out += "extra data:";
+        for (const auto& e : h.extras) {
+            out += " " + e;
+        }
+        return { true, out + "\n" };
+    }
+
+    // The same for every reference within a_radius of the player, one line each: for sweeping a settlement's deleted
+    // leftovers. Children print as FormIDs only (a link holder can have hundreds).
+    Reply HoldsNear(float a_radius, bool a_deletedOnly, const std::string& a_type)
+    {
+        const auto player = RE::PlayerCharacter::GetSingleton();
+        const auto tes = RE::TES::GetSingleton();
+        if (!player || !tes || a_radius <= 0.0f) {
+            return { false, "no player or TES, or radius not above 0" };
+        }
+        const auto origin = player->GetPosition();
+        std::vector<std::pair<float, std::string>> rows;
+        tes->ForEachReferenceInRange(origin, a_radius, [&](RE::TESObjectREFR* a_ref) {
+            const auto base = a_ref ? a_ref->GetObjectReference() : nullptr;
+            if (base && a_ref != player && (!a_deletedOnly || a_ref->GetDelete()) &&
+                (a_type.empty() || a_type == base->GetFormTypeString())) {
+                const auto h = ReadHolds(a_ref, false);
+                std::string scripts;
+                for (const auto& [name, refs] : h.scripts) {
+                    scripts += std::format("{}{}:{:X}", scripts.empty() ? "" : ",", name, refs);
+                }
+                std::string children;
+                for (const auto& c : h.children) {
+                    children += (children.empty() ? "" : ",") + c;
+                }
+                std::string aliases;
+                for (const auto& a : h.aliases) {
+                    aliases += (aliases.empty() ? "" : "; ") + a;
+                }
+                std::string extras;
+                for (const auto& e : h.extras) {
+                    extras += (extras.empty() ? "" : ",") + e;
+                }
+                std::string promoters;
+                for (const auto& p : h.promoters) {
+                    promoters += (promoters.empty() ? "" : "; ") + p;
+                }
+                const auto distance = origin.GetDistance(a_ref->GetPosition());
+                rows.emplace_back(distance, std::format("{:08X}\t{}\tflags {:08X}\trefs {}\tpersist {}{}\tscripts {}\taliases {}\tlinkedfrom {}\tpromotedby {}\textra {}",
+                    a_ref->GetFormID(), Name(base), h.formFlags, h.engineRefs,
+                    h.persistCount ? std::to_string(*h.persistCount) : "-", h.queuedPromote ? " (promote queued)" : "",
+                    scripts.empty() ? "-" : scripts, aliases.empty() ? "-" : aliases,
+                    children.empty() ? "-" : std::format("{}:{}", h.children.size(), children),
+                    promoters.empty() ? "-" : promoters, extras));
+            }
+            return RE::BSContainer::ForEachResult::kContinue;
+        });
+        std::ranges::sort(rows, {}, &std::pair<float, std::string>::first);
+        std::string out = std::format("{} references\n", rows.size());
+        for (const auto& row : rows) {
+            out += row.second + "\n";
+        }
+        return { true, out };
+    }
+
+    // ---------------------------------------------------------------- demote (dev-only fix prototype)
+    // Removes one promoter from a reference with the engine's own BGSDynamicPersistenceManager::DemoteReference
+    // (next-gen Address Library ID, reused on 1.11 like TESObjectCELL::Pick). For SS2's leftover plot objects: deleted,
+    // promoted only by themselves, so never freed (2026-11-26). With no promoters left, a deleted reference should stop
+    // being persistent and be freed like any other.
+    bool IsSelfPromoted(const Holds& a_h, std::uint32_t a_formID)
+    {
+        const auto self = std::format("{:08X}", a_formID);
+        return std::ranges::any_of(a_h.promoters, [&](const std::string& p) { return p.starts_with(self); });
+    }
+
+    std::string HoldsLine(const Holds& a_h)
+    {
+        std::string promoters;
+        for (const auto& p : a_h.promoters) {
+            promoters += (promoters.empty() ? "" : "; ") + p;
+        }
+        return std::format("flags {:08X} (persistent {}), refs {}, persist {}, promoted by {}", a_h.formFlags,
+            (a_h.formFlags & 0x400) != 0, a_h.engineRefs, a_h.persistCount ? std::to_string(*a_h.persistCount) : "-",
+            promoters.empty() ? "-" : promoters);
+    }
+
+    Reply Demote(const std::string& a_formID, const std::string& a_owner)
+    {
+        const auto form = RE::TESForm::GetFormByID(static_cast<RE::TESFormID>(std::stoul(a_formID, nullptr, 16)));
+        const auto refr = form ? form->As<RE::TESObjectREFR>() : nullptr;
+        if (!refr) {
+            return { false, "no reference " + a_formID };
+        }
+        RE::TESForm* owner = refr;
+        if (!a_owner.empty()) {
+            owner = RE::TESForm::GetFormByID(static_cast<RE::TESFormID>(std::stoul(a_owner, nullptr, 16)));
+            if (!owner) {
+                return { false, "no owner form " + a_owner };
+            }
+        }
+        const auto manager = RE::BGSDynamicPersistenceManager::GetSingleton();
+        if (!manager) {
+            return { false, "no BGSDynamicPersistenceManager" };
+        }
+        const auto before = HoldsLine(ReadHolds(refr, false));
+        const bool result = manager->DemoteReference(refr, owner, false);
+        const auto after = HoldsLine(ReadHolds(refr, false));
+        return { true, std::format("ref {}\nowner {}\nDemoteReference returned {}\nbefore: {}\nafter:  {}\n", Name(refr),
+                           Name(owner), result, before, after) };
+    }
+
+    // Demotes, by itself, every deleted reference within a_radius of the player that lists itself as a promoter.
+    Reply DemoteNear(float a_radius)
+    {
+        const auto player = RE::PlayerCharacter::GetSingleton();
+        const auto tes = RE::TES::GetSingleton();
+        const auto manager = RE::BGSDynamicPersistenceManager::GetSingleton();
+        if (!player || !tes || !manager || a_radius <= 0.0f) {
+            return { false, "no player, TES or persistence manager, or radius not above 0" };
+        }
+        std::vector<RE::TESObjectREFR*> targets;
+        tes->ForEachReferenceInRange(player->GetPosition(), a_radius, [&](RE::TESObjectREFR* a_ref) {
+            if (a_ref && a_ref->GetDelete() && IsSelfPromoted(ReadHolds(a_ref, false), a_ref->GetFormID())) {
+                targets.push_back(a_ref);
+            }
+            return RE::BSContainer::ForEachResult::kContinue;
+        });
+        std::size_t ok = 0;
+        std::string out;
+        for (const auto ref : targets) {
+            const bool result = manager->DemoteReference(ref, ref, false);
+            ok += result;
+            out += std::format("{:08X} {} -> {}\n", ref->GetFormID(), result, HoldsLine(ReadHolds(ref, false)));
+        }
+        return { true, std::format("{} deleted self-promoted references, DemoteReference true for {}\n", targets.size(), ok) + out };
+    }
+
+    // demote() for every deleted reference anywhere in memory that lists itself as a promoter (persistent references
+    // are always in memory, so this reaches the whole save, not just loaded cells). Collects FormIDs under the form
+    // map's read lock, then demotes after releasing it (freeing changes the map); each is looked up again first.
+    Reply DemoteAll()
+    {
+        const auto manager = RE::BGSDynamicPersistenceManager::GetSingleton();
+        if (!manager) {
+            return { false, "no BGSDynamicPersistenceManager" };
+        }
+        std::vector<std::uint32_t> ids;
+        std::size_t                references = 0;
+        {
+            const auto& [map, lock] = RE::TESForm::GetAllForms();
+            RE::BSAutoReadLock guard{ lock };
+            if (!map) {
+                return { false, "no form map" };
+            }
+            for (const auto& [id, form] : *map) {
+                const auto ref = form ? form->As<RE::TESObjectREFR>() : nullptr;
+                if (!ref) {
+                    continue;
+                }
+                ++references;
+                if (ref->GetDelete() && ref->extraList && ref->extraList->GetByType(RE::EXTRA_DATA_TYPE::kPromotedRef) &&
+                    IsSelfPromoted(ReadHolds(ref, false), ref->GetFormID())) {
+                    ids.push_back(id);
+                }
+            }
+        }
+        std::size_t                          freed = 0, kept = 0;
+        std::map<std::string, std::size_t>   byBase;
+        for (const auto id : ids) {
+            const auto form = RE::TESForm::GetFormByID(id);
+            const auto ref = form ? form->As<RE::TESObjectREFR>() : nullptr;
+            if (!ref) {
+                continue;
+            }
+            const auto base = Name(ref->GetObjectReference());
+            manager->DemoteReference(ref, ref, false);
+            const auto after = RE::TESForm::GetFormByID(id);
+            const auto stillRef = after ? after->As<RE::TESObjectREFR>() : nullptr;
+            if (!stillRef || (stillRef->formFlags & 0x400) == 0) {
+                ++freed;
+                byBase[base]++;
+            } else {
+                ++kept;  // another promoter still holds it (an alias, Papyrus, another reference)
+            }
+        }
+        std::vector<std::pair<std::size_t, std::string>> top;
+        for (const auto& [base, n] : byBase) {
+            top.emplace_back(n, base);
+        }
+        std::ranges::sort(top, std::greater{});
+        std::string out = std::format("{} references in memory; {} deleted and self-promoted; {} released (no longer "
+                                      "persistent), {} still held by something else\nreleased by base:\n",
+            references, ids.size(), freed, kept);
+        for (std::size_t i = 0; i < top.size() && i < 25; ++i) {
+            out += std::format("  {:7} {}\n", top[i].first, top[i].second);
+        }
+        return { true, out };
+    }
+
+    // ---------------------------------------------------------------- promote hook (dev-only)
+    // Who promotes a reference by itself? (SS2 plot parts do, and are then never freed, 2026-11-26.) A detour on
+    // BGSDynamicPersistenceManager::PromoteReference records each call where the owner is the reference itself (or
+    // every call, in "all" mode) with a native backtrace, as module+offset, to map to engine functions offline.
+    // The detour overwrites only the entry's first instruction, "mov [rsp+20h], rbx" (48 89 5C 24 20, 5 bytes, checked
+    // before patching: the next instruction is RIP-relative and must not move). A gateway in the F4SE trampoline runs
+    // that instruction and jumps back to entry+5. Installed on request only; recording can be switched off, but the
+    // detour stays until the game exits.
+    namespace PromoteHook
+    {
+        using Fn = bool (*)(RE::BGSDynamicPersistenceManager*, RE::TESObjectREFR*, RE::TESForm*);
+        constexpr std::uint8_t kPrologue[5]{ 0x48, 0x89, 0x5C, 0x24, 0x20 };
+        constexpr std::size_t  kMaxRecords = 3000;
+
+        Fn                      gateway{ nullptr };
+        std::atomic_bool        installed{ false };
+        std::atomic_bool        recording{ false };
+        std::atomic_bool        allCalls{ false };
+        std::mutex              lock;
+        std::deque<std::string> records;
+        std::uint64_t           dropped{ 0 };
+
+        std::string Frame(void* a_address)
+        {
+            HMODULE module = nullptr;
+            if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    static_cast<LPCWSTR>(a_address), &module) || !module) {
+                return std::format("?{:X}", reinterpret_cast<std::uintptr_t>(a_address));
+            }
+            wchar_t path[MAX_PATH]{};
+            GetModuleFileNameW(module, path, MAX_PATH);
+            const auto name = std::filesystem::path(path).filename().string();
+            return std::format("{}+{:X}", name,
+                reinterpret_cast<std::uintptr_t>(a_address) - reinterpret_cast<std::uintptr_t>(module));
+        }
+
+        bool Hook(RE::BGSDynamicPersistenceManager* a_manager, RE::TESObjectREFR* a_ref, RE::TESForm* a_owner)
+        {
+            if (recording && a_ref && (allCalls || static_cast<RE::TESForm*>(a_ref) == a_owner)) {
+                void*      frames[24]{};
+                const auto count = RtlCaptureStackBackTrace(1, 24, frames, nullptr);
+                const auto base = a_ref->GetObjectReference();
+                auto line = std::format("{} t{} ref {:08X} base {:08X} owner {:08X}{} |", Clock(), GetCurrentThreadId(),
+                    a_ref->GetFormID(), base ? base->GetFormID() : 0, a_owner ? a_owner->GetFormID() : 0,
+                    static_cast<RE::TESForm*>(a_ref) == a_owner ? " SELF" : "");
+                for (USHORT i = 0; i < count; ++i) {
+                    line += " " + Frame(frames[i]);
+                }
+                std::scoped_lock guard{ lock };
+                if (records.size() >= kMaxRecords) {
+                    records.pop_front();
+                    ++dropped;
+                }
+                records.push_back(std::move(line));
+            }
+            return gateway(a_manager, a_ref, a_owner);
+        }
+
+        Reply Install()
+        {
+            if (installed) {
+                return { true, "already installed" };
+            }
+            REL::Relocation<std::uintptr_t> target{ RE::ID::BGSDynamicPersistenceManager::PromoteReference };
+            const auto                      entry = target.address();
+            std::uint8_t                    current[5]{};
+            std::memcpy(current, reinterpret_cast<const void*>(entry), 5);
+            if (std::memcmp(current, kPrologue, 5) != 0) {
+                return { false, std::format("PromoteReference at {:X} starts with {:02X} {:02X} {:02X} {:02X} {:02X}, not the "
+                                            "expected 48 89 5C 24 20; not hooking", entry, current[0], current[1], current[2],
+                                    current[3], current[4]) };
+            }
+            auto& trampoline = REL::GetTrampoline();
+            if (trampoline.empty() || trampoline.free_size() < 64) {
+                return { false, "no F4SE trampoline space" };
+            }
+            // Gateway: the stolen instruction, then jmp [rip+0] to entry+5.
+            auto code = static_cast<std::uint8_t*>(trampoline.allocate(5 + 14));
+            std::memcpy(code, kPrologue, 5);
+            const std::uint8_t jump[6]{ 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00 };
+            std::memcpy(code + 5, jump, 6);
+            const std::uint64_t back = entry + 5;
+            std::memcpy(code + 11, &back, 8);
+            gateway = reinterpret_cast<Fn>(code);
+            trampoline.write_jmp<5>(entry, reinterpret_cast<std::uintptr_t>(&Hook));
+            installed = true;
+            return { true, std::format("hooked PromoteReference at {:X}", entry) };
+        }
+
+        Reply Command(const std::vector<std::string>& a_parts)
+        {
+            const auto sub = a_parts.size() >= 3 ? a_parts[2] : std::string{ "read" };
+            if (sub == "on") {
+                const auto reply = Install();
+                if (!reply.ok) {
+                    return reply;
+                }
+                allCalls = a_parts.size() >= 4 && a_parts[3] == "all";
+                recording = true;
+                return { true, reply.text + std::format("; recording {} calls", allCalls ? "all" : "self-promotion") };
+            }
+            if (sub == "off") {
+                recording = false;
+                return { true, "recording off (the detour stays until the game exits)" };
+            }
+            std::scoped_lock guard{ lock };
+            if (sub == "clear") {
+                records.clear();
+                dropped = 0;
+                return { true, "cleared" };
+            }
+            const std::size_t want = a_parts.size() >= 4 ? std::stoul(a_parts[3]) : 200;
+            std::string out = std::format("installed {}, recording {}, {} records ({} dropped)\n", installed.load(),
+                recording.load(), records.size(), dropped);
+            const auto start = records.size() > want ? records.size() - want : 0;
+            for (std::size_t i = start; i < records.size(); ++i) {
+                out += records[i] + "\n";
+            }
+            return { true, out };
+        }
+    }
+
     // One actor's AI and appearance: life state, talking to the player, the furniture it is using, the AI package it
     // is running (and that package's target), and the items it has equipped. Replaces screenshots and guessing.
     // Reads data members only. The first version also called virtual functions (IsInCombat, IsTalking,
@@ -511,6 +998,130 @@ namespace Bridge
             return { false, "the game didn't create the reference" };
         }
         return { true, std::format("placed {}\n{}", Name(ref.get()), Where(ref.get())) };
+    }
+
+    // ---------------------------------------------------------------- batches (mock-ups)
+
+    // Lines a_start .. a_start+a_count-1 of a text file (blank lines and # comments skipped).
+    std::vector<std::string> FileLines(const std::string& a_path, std::size_t a_start, std::size_t a_count)
+    {
+        std::ifstream in(a_path);
+        if (!in) {
+            throw std::runtime_error("can't read " + a_path);
+        }
+        std::vector<std::string> out;
+        std::string              line;
+        std::size_t              n = 0;
+        while (std::getline(in, line)) {
+            if (line.empty() || line[0] == '#') {
+                continue;
+            }
+            if (n >= a_start && out.size() < a_count) {
+                out.push_back(line);
+            }
+            ++n;
+        }
+        return out;
+    }
+
+    // Places one reference per line ("FORMID x y z rx ry rz scale", angles in degrees) in the player's worldspace or
+    // interior, and appends "placed <ref>" per new reference to a_record, so undobatch can remove exactly those.
+    Reply PlaceBatch(const std::string& a_list, const std::string& a_record, std::size_t a_start, std::size_t a_count)
+    {
+        const auto player = RE::PlayerCharacter::GetSingleton();
+        const auto cell = player ? player->GetParentCell() : nullptr;
+        const auto handler = RE::TESDataHandler::GetSingleton();
+        if (!cell || !handler) {
+            return { false, "no player cell" };
+        }
+        std::ofstream record(a_record, std::ios::app);
+        std::size_t   placed = 0;
+        std::string   errors;
+        for (const auto& line : FileLines(a_list, a_start, a_count)) {
+            std::istringstream ss(line);
+            std::string        id;
+            float              x, y, z, rx, ry, rz, scale = 1.0f;
+            if (!(ss >> id >> x >> y >> z >> rx >> ry >> rz)) {
+                errors += "bad line: " + line + "\n";
+                continue;
+            }
+            ss >> scale;
+            const auto form = RE::TESForm::GetFormByID(static_cast<RE::TESFormID>(std::stoul(id, nullptr, 16)));
+            const auto base = form ? form->As<RE::TESBoundObject>() : nullptr;
+            if (!base) {
+                errors += "no base " + id + "\n";
+                continue;
+            }
+            RE::NEW_REFR_DATA data;
+            data.location = RE::NiPoint3{ x, y, z };
+            constexpr float toRad = 3.14159265f / 180.0f;
+            data.direction = RE::NiPoint3{ rx * toRad, ry * toRad, rz * toRad };
+            data.object = base;
+            if (cell->IsInterior()) {
+                data.interior = cell;
+            } else {
+                data.world = cell->worldSpace;
+            }
+            const auto ref = handler->CreateReferenceAtLocation(data).get();
+            if (!ref) {
+                errors += "not created " + id + "\n";
+                continue;
+            }
+            const auto refID = std::format("{:08X}", ref->GetFormID());
+            if (std::abs(scale - 1.0f) > 0.001f) {
+                RE::Console::ExecuteCommand(std::format("{}.setscale {:.3f}", refID, scale).c_str());
+            }
+            record << "placed " << refID << "\n";
+            ++placed;
+        }
+        return { true, std::format("placed {} of lines {}..{}\n{}", placed, a_start, a_start + a_count - 1, errors) };
+    }
+
+    // Disables one existing reference per line (its load-order FormID first on the line), appending "disabled <ref>"
+    // to a_record. For a mock-up's scrap list: undobatch enables them again.
+    Reply DisableBatch(const std::string& a_list, const std::string& a_record, std::size_t a_start, std::size_t a_count)
+    {
+        std::ofstream record(a_record, std::ios::app);
+        std::size_t   done = 0;
+        std::string   errors;
+        for (const auto& line : FileLines(a_list, a_start, a_count)) {
+            const auto id = line.substr(0, line.find_first_of(" \t"));
+            const auto form = RE::TESForm::GetFormByID(static_cast<RE::TESFormID>(std::stoul(id, nullptr, 16)));
+            const auto ref = form ? form->As<RE::TESObjectREFR>() : nullptr;
+            if (!ref || ref->IsDisabled()) {
+                errors += (ref ? "already disabled " : "no reference ") + id + "\n";
+                continue;
+            }
+            RE::Console::ExecuteCommand(std::format("{}.disable", id).c_str());
+            record << "disabled " << id << "\n";
+            ++done;
+        }
+        return { true, std::format("disabled {}\n{}", done, errors) };
+    }
+
+    // Undoes a record in two passes, on separate frames (the console's disable and markfordelete in one frame leave
+    // the reference drawn, tested 2026-11-24): pass 0 disables "placed" references and enables "disabled" ones again,
+    // pass 1 marks the placed ones for delete.
+    Reply UndoBatch(const std::string& a_record, std::size_t a_start, std::size_t a_count, int a_pass)
+    {
+        std::size_t removed = 0, enabled = 0;
+        for (const auto& line : FileLines(a_record, a_start, a_count)) {
+            std::istringstream ss(line);
+            std::string        what, id;
+            ss >> what >> id;
+            const auto form = RE::TESForm::GetFormByID(static_cast<RE::TESFormID>(std::stoul(id, nullptr, 16)));
+            if (!form || !form->As<RE::TESObjectREFR>()) {
+                continue;
+            }
+            if (what == "placed") {
+                RE::Console::ExecuteCommand((a_pass == 0 ? std::format("{}.disable", id) : std::format("{}.markfordelete", id)).c_str());
+                ++removed;
+            } else if (what == "disabled" && a_pass == 0) {
+                RE::Console::ExecuteCommand(std::format("{}.enable", id).c_str());
+                ++enabled;
+            }
+        }
+        return { true, std::format("pass {}: placed {}, enabled {}", a_pass, removed, enabled) };
     }
 
     // Queues a screenshot, as the screenshot key does. It's saved to the game's sScreenShotBaseName (Fallout4Prefs.ini).
@@ -1305,6 +1916,54 @@ namespace Bridge
             });
         }
 
+        if (op == "holds" && a_parts.size() >= 3) {
+            const auto formID = a_parts[2];
+            return OnMainThread([formID]() {
+                try {
+                    return HoldsInfo(formID);
+                } catch (const std::exception& e) {
+                    return Reply{ false, e.what() };
+                }
+            });
+        }
+
+        if (op == "demote" && a_parts.size() >= 3) {
+            const auto formID = a_parts[2];
+            const auto owner = a_parts.size() >= 4 ? a_parts[3] : std::string{};
+            return OnMainThread([formID, owner]() {
+                try {
+                    return Demote(formID, owner);
+                } catch (const std::exception& e) {
+                    return Reply{ false, e.what() };
+                }
+            });
+        }
+
+        if (op == "promotehook") {
+            const auto parts = a_parts;
+            const auto sub = parts.size() >= 3 ? parts[2] : std::string{};
+            if (sub == "on") {
+                return OnMainThread([parts]() { return PromoteHook::Command(parts); });
+            }
+            return PromoteHook::Command(parts);  // reading the buffer doesn't need the main thread
+        }
+
+        if (op == "demoteall") {
+            return OnMainThread([]() { return DemoteAll(); });
+        }
+
+        if (op == "demotenear" && a_parts.size() >= 3) {
+            const auto radius = std::stof(a_parts[2]);
+            return OnMainThread([radius]() { return DemoteNear(radius); });
+        }
+
+        if (op == "holdsnear" && a_parts.size() >= 3) {
+            const auto radius = std::stof(a_parts[2]);
+            const bool deletedOnly = a_parts.size() < 4 || a_parts[3] != "0";
+            const auto type = a_parts.size() >= 5 ? a_parts[4] : std::string{};
+            return OnMainThread([radius, deletedOnly, type]() { return HoldsNear(radius, deletedOnly, type); });
+        }
+
         if (op == "actor" && a_parts.size() >= 3) {
             const auto formID = a_parts[2];
             return OnMainThread([formID]() {
@@ -1314,6 +1973,43 @@ namespace Bridge
                     return Reply{ false, e.what() };
                 }
             });
+        }
+
+        // placebatch|disablebatch <list> <record> <start> <count>; undobatch <record> <start> <count>
+        if ((op == "placebatch" || op == "disablebatch") && a_parts.size() >= 6) {
+            try {
+                const auto list = a_parts[2];
+                const auto record = a_parts[3];
+                const auto start = static_cast<std::size_t>(std::stoul(a_parts[4]));
+                const auto count = static_cast<std::size_t>(std::stoul(a_parts[5]));
+                const bool place = op == "placebatch";
+                return OnMainThread([list, record, start, count, place]() {
+                    try {
+                        return place ? PlaceBatch(list, record, start, count) : DisableBatch(list, record, start, count);
+                    } catch (const std::exception& e) {
+                        return Reply{ false, e.what() };
+                    }
+                });
+            } catch (const std::exception& e) {
+                return Reply{ false, e.what() };
+            }
+        }
+        if (op == "undobatch" && a_parts.size() >= 5) {
+            try {
+                const auto record = a_parts[2];
+                const auto start = static_cast<std::size_t>(std::stoul(a_parts[3]));
+                const auto count = static_cast<std::size_t>(std::stoul(a_parts[4]));
+                const int  pass = a_parts.size() >= 6 ? std::stoi(a_parts[5]) : 0;
+                return OnMainThread([record, start, count, pass]() {
+                    try {
+                        return UndoBatch(record, start, count, pass);
+                    } catch (const std::exception& e) {
+                        return Reply{ false, e.what() };
+                    }
+                });
+            } catch (const std::exception& e) {
+                return Reply{ false, e.what() };
+            }
         }
 
         // scripted <radius> <script> <var,var,...> [x y z] [enabled_only 0/1]
@@ -1590,7 +2286,10 @@ namespace Main
 
         static std::once_flag once;
         std::call_once(once, [&]() {
-            F4SE::Init(a_f4se);
+            F4SE::InitInfo info;
+            info.trampoline = true;  // for the dev-only promote hook (PromoteHook), installed only on request
+            info.trampolineSize = 256;
+            F4SE::Init(a_f4se, info);
             Bridge::runtimeVersion = a_f4se->RuntimeVersion().string();
             isInit = true;
         });

@@ -12,14 +12,16 @@ It was built to debug Workshop Framework and Sim Settlements 2 scripts while the
 | Part | What it does |
 |---|---|
 | `GameBridge.dll` (`src/`) | F4SE plugin. Listens on `127.0.0.1:47830` on its own thread, so `ping` answers even when Papyrus is jammed. Anything that touches game state runs on the main thread through F4SE's task queue. |
-| `server.py` | MCP server that talks to the plugin. Its tools: `game_status`, `game_console`, `game_script_vars`, `game_player`, `game_ref`, `game_actor`, `game_refs_near`, `game_scripted_refs`, `game_plots`, `game_place`, `game_screenshot`, `game_perf`, `game_quest`, `game_quest_events`, `game_global`, `game_av`, `game_camera`, `game_camera_look`, `game_camera_fly`, `game_camera_orbit`, `game_camera_path`, `game_crosshair`, `game_move`, `game_wait_for_load`, `wsfw_runners`, `papyrus_stacks`, `read_log`, `latest_screenshots`. |
+| `server.py` | MCP server that talks to the plugin. Its tools: `game_status`, `game_console`, `game_script_vars`, `game_player`, `game_ref`, `game_ref_holds`, `game_ref_holds_near`, `game_ref_demote`, `game_ref_demote_near`, `game_ref_demote_all`, `game_promote_hook`, `game_actor`, `game_refs_near`, `game_scripted_refs`, `game_plots`, `game_place`, `game_place_batch`, `game_disable_batch`, `game_undo_batch`, `game_screenshot`, `game_perf`, `game_quest`, `game_quest_events`, `game_global`, `game_av`, `game_camera`, `game_camera_look`, `game_camera_fly`, `game_camera_orbit`, `game_camera_path`, `game_crosshair`, `game_move`, `game_wait_for_load`, `wsfw_runners`, `papyrus_stacks`, `read_log`, `latest_screenshots`. |
 
 The protocol is one line each way: `id<TAB>op[<TAB>arg...]` in, `{"id":"...","ok":true,"result":"..."}` out. The
 operations are `ping`, `console <command>`, `vars <formid hex> <script>`, `player`, `ref <formid hex>`, `actor <formid hex>`,
 `near <radius> [<base form type> [<x> <y> <z>]]`, `perf [<seconds>]`, `place <formid hex> [<distance>]`,
 `screenshot`, `quest <formid hex or editor ID>`, `questlog [<count>]`, `global <formid hex or editor ID>`,
 `camera <subcommand> [<arg>...]` (`status`, `free`, `release`, `stop`, `look`, `fly`, `orbit`, `path`; a point is
-`x,y,z` or a reference's FormID), `crosshair [<range>]`, `move <formid> <to|-> <offset|-> <rotation|->` and `loads`
+`x,y,z` or a reference's FormID), `crosshair [<range>]`, `move <formid> <to|-> <offset|-> <rotation|->`,
+`holds <formid hex>`, `holdsnear <radius> [<deleted only 0|1> [<base form type>]]`, `demote`, `demotenear`,
+`demoteall`, `promotehook on [all]|off|clear|read [<count>]`, `placebatch`, `disablebatch`, `undobatch` and `loads`
 (answered before game data is ready too).
 
 - `game_player`: the player's cell, position and rotation (degrees).
@@ -30,8 +32,24 @@ operations are `ping`, `console <command>`, `vars <formid hex> <script>`, `playe
   package's target, the furniture it's using or heading to (a sitting NPC is using a chair or sit marker), and its
   equipped items. It reads data members only: calling some engine functions by vtable slot or address crashed
   runtime 1.11.240.
+- `game_ref_holds`: what keeps a reference alive. A deleted reference is only freed once nothing persists it, and a
+  save doesn't say what does. It reports the form flags (deleted, persistent, disabled) and engine refcount, the
+  Papyrus persist count on the reference's handle, each script bound to it with the script object's refcount, the
+  quest aliases holding it, every reference linking to it, who promoted it to persistent (`ExtraPromotedRef`), and
+  the type of each extra data on it. `game_ref_holds_near` does the same for every reference near the player (deleted
+  ones by default), one line each, with `save_to` for a whole settlement. Data members only, read guarded where
+  CommonLibF4 doesn't define the layout.
+- Dev-only, for testing fixes on a test profile (they change the running game): `game_ref_demote` removes one
+  promoter from a reference through the engine's `BGSDynamicPersistenceManager::DemoteReference`;
+  `game_ref_demote_near` and `game_ref_demote_all` do it for every deleted reference that promoted itself, nearby or in
+  the whole save. `game_promote_hook` installs a detour on the engine's `PromoteReference` (it checks the function's
+  first bytes and refuses if they differ) and records each self-promotion, or every promotion, with a native
+  backtrace as module+offset.
 - `game_place`: places a new reference of a base object in front of the player, upright and turned the way the
   player faces, and returns its FormID. Handy for looking at a new mesh in game.
+- `game_place_batch`, `game_disable_batch`, `game_undo_batch`: for mock-ups. Place many objects from a list file
+  (`FORMID x y z rx ry rz scale` per line, 100 per frame) as plain references, or disable existing ones (a scrap list),
+  writing each to a record file; `game_undo_batch` reverses exactly what a record lists.
 - `game_screenshot`: takes a screenshot through the game's own screenshot function and returns it. Set
   `FO4_GAME_SCREENSHOTS` to the folder in the game's `sScreenShotBaseName` (`[Display]` in `Fallout4Prefs.ini` or
   your custom ini), with `bAllowScreenshot=1`.
